@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import json
+import logging
+import time
+import uuid
+from collections import defaultdict
+from datetime import UTC
+from typing import Any
+
+import pyarrow as pa
+from confluent_kafka import Consumer, KafkaError, Message, Producer
+from prometheus_client import Counter
+from pydantic import ValidationError
+
+from feature_store.config import get_settings
+from feature_store.db import SessionLocal, init_db
+from feature_store.jobs import JobService
+from feature_store.models import StreamFeatureEvent, validate_feature_value
+from feature_store.observability import configure_logging
+from feature_store.offline import OfflineStore
+from feature_store.online import OnlineStore
+from feature_store.registry import Registry
+
+logger = logging.getLogger(__name__)
+CONSUMED = Counter("feature_store_stream_events_total", "Stream events", ["result"])
+
+
+class StreamConsumer:
+    def __init__(
+        self,
+        consumer: Consumer,
+        producer: Producer,
+        offline: OfflineStore | None = None,
+        online: OnlineStore | None = None,
+    ):
+        self.consumer = consumer
+        self.producer = producer
+        self.offline = offline or OfflineStore()
+        self.online = online or OnlineStore()
+        self.settings = get_settings()
+        self.buffers: dict[str, list[tuple[StreamFeatureEvent, Message]]] = defaultdict(list)
+        self.last_flush = time.monotonic()
+
+    def subscribe(self) -> None:
+        with SessionLocal() as session:
+            records = Registry(session).list_records("stream_source")
+            topics = sorted({record["spec"]["topic"] for record in records})
+        if not topics:
+            raise RuntimeError("no stream sources registered")
+        self.consumer.subscribe(topics)
+        logger.info("subscribed to %s", topics)
+
+    def loop(self) -> None:
+        self.subscribe()
+        try:
+            while True:
+                message = self.consumer.poll(0.5)
+                if message is not None:
+                    self._handle(message)
+                if self._should_flush():
+                    self.flush()
+        finally:
+            self.flush()
+            self.consumer.close()
+
+    def _handle(self, message: Message) -> None:
+        error = message.error()
+        if error:
+            if error.code() != KafkaError._PARTITION_EOF:
+                logger.error("consumer error: %s", error)
+            return
+        try:
+            raw_value = message.value()
+            if raw_value is None:
+                raise ValueError("message value is empty")
+            payload = json.loads(raw_value)
+            event = StreamFeatureEvent.model_validate(payload)
+            if event.event_timestamp.tzinfo is None:
+                raise ValueError("event_timestamp must include a timezone")
+            with SessionLocal() as session:
+                registry = Registry(session)
+                view = registry.feature_view(event.feature_view)
+                if not view.stream_source:
+                    raise ValueError(f"{view.ref} has no stream source")
+                stream = registry.stream_source(view.stream_source)
+                if stream.topic != message.topic():
+                    raise ValueError(f"{view.ref} is not configured for topic {message.topic()}")
+                entity = registry.entity(view.entity)
+                missing_keys = set(entity.join_keys) - set(event.entity_values)
+                if missing_keys:
+                    raise ValueError(f"missing entity keys: {sorted(missing_keys)}")
+                expected = {feature.name for feature in view.features}
+                if set(event.values) != expected:
+                    raise ValueError(
+                        f"feature values must exactly match schema; expected {sorted(expected)}"
+                    )
+                for feature in view.features:
+                    validate_feature_value(feature.dtype, event.values[feature.name])
+            self.online.upsert(event)
+            self.buffers[event.feature_view].append((event, message))
+            CONSUMED.labels("accepted").inc()
+        except (ValueError, ValidationError, json.JSONDecodeError) as exc:
+            self._dead_letter(message, str(exc))
+            self.flush()
+            self.consumer.commit(message=message, asynchronous=False)
+            CONSUMED.labels("dead_lettered").inc()
+
+    def _dead_letter(self, message: Message, error: str) -> None:
+        topic = f"{message.topic()}.dlq"
+        with SessionLocal() as session:
+            for record in Registry(session).list_records("stream_source"):
+                spec = record["spec"]
+                if spec["topic"] == message.topic() and spec.get("dead_letter_topic"):
+                    topic = spec["dead_letter_topic"]
+                    break
+        self.producer.produce(
+            topic,
+            key=message.key(),
+            value=message.value(),
+            headers={"feature-store-error": error[:500]},
+        )
+        self.producer.flush(10)
+
+    def _should_flush(self) -> bool:
+        count = sum(len(buffer) for buffer in self.buffers.values())
+        return count >= self.settings.stream_batch_size or (
+            count > 0 and time.monotonic() - self.last_flush >= self.settings.stream_flush_seconds
+        )
+
+    def flush(self) -> None:
+        staged_messages: list[Message] = []
+        for view_ref, buffer in list(self.buffers.items()):
+            if not buffer:
+                continue
+            self._flush_view(view_ref, buffer)
+            staged_messages.extend(message for _, message in buffer)
+            self.buffers[view_ref] = []
+        self._commit_latest(staged_messages)
+        self.last_flush = time.monotonic()
+
+    def _flush_view(self, view_ref: str, buffer: list[tuple[StreamFeatureEvent, Message]]) -> None:
+        with SessionLocal() as session:
+            registry = Registry(session)
+            view = registry.feature_view(view_ref)
+            entity = registry.entity(view.entity)
+            feature_names = [feature.name for feature in view.features]
+            rows: list[dict[str, Any]] = []
+            for event, _ in buffer:
+                timestamp = event.event_timestamp.astimezone(UTC)
+                rows.append(
+                    {
+                        **{key: event.entity_values[key] for key in entity.join_keys},
+                        "event_timestamp": timestamp,
+                        "event_id": event.event_id,
+                        **{name: event.values[name] for name in feature_names},
+                        "event_date": timestamp.date().isoformat(),
+                    }
+                )
+            table = pa.Table.from_pylist(rows)
+            staging_uri = (
+                f"s3://{self.settings.offline_bucket}/staging/{view_ref.replace('@', '/')}/"
+                f"{uuid.uuid4()}"
+            )
+            self.offline.append(staging_uri, table, partition_by="event_date")
+            JobService(session).create_offline_append(view_ref, staging_uri)
+
+        logger.info("staged %d events for %s", len(buffer), view_ref)
+
+    def _commit_latest(self, messages: list[Message]) -> None:
+        latest_by_partition: dict[tuple[str, int], Message] = {}
+        for message in messages:
+            topic = message.topic()
+            partition = message.partition()
+            offset = message.offset()
+            if topic is None or partition is None or offset is None:
+                raise ValueError("Kafka message is missing topic, partition, or offset")
+            key = (topic, partition)
+            previous = latest_by_partition.get(key)
+            previous_offset = previous.offset() if previous is not None else None
+            if previous is None or previous_offset is None or offset > previous_offset:
+                latest_by_partition[key] = message
+        for message in latest_by_partition.values():
+            self.consumer.commit(message=message, asynchronous=False)
+
+
+def run() -> None:
+    settings = get_settings()
+    configure_logging(settings.log_level)
+    init_db()
+    consumer = Consumer(
+        {
+            "bootstrap.servers": settings.kafka_bootstrap_servers,
+            "group.id": "feature-store-stream-consumer",
+            "enable.auto.commit": False,
+            "auto.offset.reset": "earliest",
+        }
+    )
+    producer = Producer({"bootstrap.servers": settings.kafka_bootstrap_servers})
+    StreamConsumer(consumer, producer).loop()
+
+
+if __name__ == "__main__":
+    run()

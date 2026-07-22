@@ -1,0 +1,67 @@
+[project]
+name = "distributed-feature-store"
+version = "0.1.0"
+description = "A local-first distributed feature store with Delta Lake, Redis, and Redpanda"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14",
+  "confluent-kafka>=2.6",
+  "deltalake>=1.0",
+  "duckdb>=1.2",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "prometheus-client>=0.21",
+  "psycopg[binary]>=3.2",
+  "pyarrow>=18",
+  "pydantic-settings>=2.7",
+  "pyyaml>=6.0",
+  "redis>=5.2",
+  "sqlalchemy>=2.0",
+  "typer>=0.15",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.optional-dependencies]
+dev = [
+  "fakeredis>=2.26",
+  "mypy>=1.14",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "ruff>=0.9",
+]
+
+[project.scripts]
+feature-store = "feature_store.cli:app"
+feature-store-api = "feature_store.api:run"
+feature-store-worker = "feature_store.worker:run"
+feature-store-stream = "feature_store.streaming:run"
+feature-store-benchmark = "feature_store.benchmark:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/feature_store"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"examples/fraud/registry.yaml" = "feature_store/examples/fraud_registry.yaml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=feature_store --cov-report=term-missing"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true

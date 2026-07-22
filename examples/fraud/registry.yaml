@@ -1,0 +1,58 @@
+entities:
+  - name: account
+    join_keys:
+      account_id: string
+
+batch_sources:
+  - name: transactions
+    uri: s3://feature-store/sources/transactions
+    event_timestamp_field: event_timestamp
+
+stream_sources:
+  - name: account_features_stream
+    topic: fraud.account-features.v1
+    dead_letter_topic: fraud.account-features.v1.dlq
+
+feature_views:
+  - name: account_transaction_features
+    version: 1.0.0
+    entity: account
+    batch_source: transactions
+    stream_source: account_features_stream
+    ttl_seconds: 86400
+    description: Rolling account transaction signals for fraud scoring.
+    features:
+      - name: txn_count_1h
+        dtype: int64
+      - name: amount_sum_24h
+        dtype: float64
+      - name: country_mismatch
+        dtype: bool
+      - name: account_age_days
+        dtype: int64
+    batch_sql: |
+      SELECT
+        account_id,
+        event_timestamp,
+        transaction_id AS event_id,
+        CAST(COUNT(*) OVER (
+          PARTITION BY account_id ORDER BY event_timestamp
+          RANGE BETWEEN INTERVAL 1 HOUR PRECEDING AND CURRENT ROW
+        ) AS BIGINT) AS txn_count_1h,
+        CAST(SUM(amount) OVER (
+          PARTITION BY account_id ORDER BY event_timestamp
+          RANGE BETWEEN INTERVAL 24 HOURS PRECEDING AND CURRENT ROW
+        ) AS DOUBLE) AS amount_sum_24h,
+        merchant_country <> home_country AS country_mismatch,
+        CAST(DATE_DIFF('day', account_created_at, event_timestamp) AS BIGINT)
+          AS account_age_days
+      FROM source
+
+feature_services:
+  - name: fraud_model_v1
+    description: Feature contract used by the example fraud model.
+    features:
+      - account_transaction_features@1.0.0:txn_count_1h
+      - account_transaction_features@1.0.0:amount_sum_24h
+      - account_transaction_features@1.0.0:country_mismatch
+      - account_transaction_features@1.0.0:account_age_days
