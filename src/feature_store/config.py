@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     api_url: str = "http://localhost:8000"
     inline_query_limit: int = 10_000
     job_poll_seconds: float = 1.0
+    job_lease_seconds: int = 30
+    job_heartbeat_seconds: int = 10
+    job_max_attempts: int = 3
+    job_retry_base_seconds: int = 5
+    job_retry_max_seconds: int = 60
     stream_batch_size: int = 500
     stream_flush_seconds: float = 2.0
     log_level: str = "INFO"

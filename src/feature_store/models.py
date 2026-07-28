@@ -187,9 +187,17 @@ class JobKind(StrEnum):
 class JobStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
+    RETRYING = "retrying"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    EXHAUSTED = "exhausted"
     CANCELLED = "cancelled"
+
+
+class JobFailureKind(StrEnum):
+    RETRYABLE = "retryable"
+    TERMINAL = "terminal"
+    LEASE_EXPIRED = "lease_expired"
 
 
 class JobRequest(StrictModel):
