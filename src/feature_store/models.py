@@ -207,7 +207,7 @@ class JobRequest(StrictModel):
 
 
 class StreamFeatureEvent(StrictModel):
-    event_id: str
+    event_id: str = Field(min_length=1, max_length=256)
     feature_view: str
     entity_values: dict[str, Any]
     event_timestamp: datetime
@@ -218,6 +218,12 @@ class StreamFeatureEvent(StrictModel):
         if self.event_timestamp.tzinfo is None:
             raise ValueError("event_timestamp must include a timezone")
         return self
+
+
+class StreamEventState(StrEnum):
+    PENDING = "pending"
+    STAGED = "staged"
+    APPLIED = "applied"
 
 
 def validate_feature_value(dtype: ValueType, value: Any) -> None:

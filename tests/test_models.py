@@ -11,6 +11,7 @@ from feature_store.models import (
     FeatureView,
     HistoricalQuery,
     Observation,
+    StreamFeatureEvent,
     ValueType,
     validate_feature_value,
 )
@@ -60,4 +61,16 @@ def test_observation_requires_timezone() -> None:
         Observation(
             entity_values={"account_id": "a"},
             event_timestamp=datetime(2025, 1, 1),
+        )
+
+
+@pytest.mark.parametrize("event_id", ["", "x" * 257])
+def test_stream_event_id_must_be_non_empty_and_bounded(event_id: str) -> None:
+    with pytest.raises(ValidationError):
+        StreamFeatureEvent(
+            event_id=event_id,
+            feature_view="account_stats@1.0.0",
+            entity_values={"account_id": "a"},
+            event_timestamp=datetime.now(UTC),
+            values={"amount": 1.0},
         )

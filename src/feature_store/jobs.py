@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import traceback
-from datetime import UTC, datetime, timedelta
+from contextlib import suppress
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import duckdb
@@ -10,12 +12,13 @@ import pyarrow.compute as pc
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from feature_store.db import JobRecord
+from feature_store.db import JobRecord, StreamEventRecord
 from feature_store.models import (
     Feature,
     JobKind,
     JobRequest,
     JobStatus,
+    StreamEventState,
     StreamFeatureEvent,
     ValueType,
 )
@@ -50,7 +53,9 @@ class JobService:
         self.session.refresh(job)
         return job
 
-    def create_offline_append(self, feature_view: str, staging_uri: str) -> JobRecord:
+    def create_offline_append(
+        self, feature_view: str, staging_uri: str, *, commit: bool = True
+    ) -> JobRecord:
         job = JobRecord(
             kind=JobKind.OFFLINE_APPEND,
             status=JobStatus.PENDING,
@@ -58,8 +63,11 @@ class JobService:
             checkpoints=[],
         )
         self.session.add(job)
-        self.session.commit()
-        self.session.refresh(job)
+        if commit:
+            self.session.commit()
+            self.session.refresh(job)
+        else:
+            self.session.flush()
         return job
 
     def get(self, job_id: str) -> JobRecord:
@@ -136,24 +144,31 @@ class JobExecutor:
         return job
 
     def execute(self, job: JobRecord) -> None:
+        cleanup_uri: str | None = None
         try:
             if job.kind == JobKind.BACKFILL:
                 self._backfill(job)
             elif job.kind == JobKind.MATERIALIZE:
                 self._materialize(job)
             elif job.kind == JobKind.OFFLINE_APPEND:
-                self._offline_append(job)
+                cleanup_uri = self._offline_append(job)
             else:
                 raise ValueError(f"unsupported job kind: {job.kind}")
             if job.status != JobStatus.CANCELLED:
                 job.status = JobStatus.SUCCEEDED
                 job.finished_at = datetime.now(UTC)
+                if job.kind == JobKind.OFFLINE_APPEND:
+                    self._mark_stream_events_applied(job)
                 self.session.commit()
         except Exception:
             job.status = JobStatus.FAILED
             job.error = traceback.format_exc(limit=10)
             job.finished_at = datetime.now(UTC)
             self.session.commit()
+            return
+        if cleanup_uri:
+            with suppress(Exception):
+                self.offline.delete(cleanup_uri)
 
     def _backfill(self, job: JobRecord) -> None:
         view = self.registry.feature_view(job.payload["feature_view"])
@@ -238,13 +253,88 @@ class JobExecutor:
         job.checkpoints = [f"materialized:{latest.num_rows}"]
         self.session.commit()
 
-    def _offline_append(self, job: JobRecord) -> None:
+    def _offline_append(self, job: JobRecord) -> str:
         staging = self.offline.load(job.payload["staging_uri"])
         target = self.offline.view_uri(job.payload["feature_view"])
-        self.offline.append(target, staging, partition_by="event_date")
-        self.offline.delete(job.payload["staging_uri"])
-        job.checkpoints = [f"appended:{staging.num_rows}"]
-        self.session.commit()
+        unseen = self._unseen_rows(staging, target)
+        if unseen.num_rows:
+            self.offline.append(target, unseen, partition_by="event_date")
+        job.checkpoints = [
+            f"appended:{unseen.num_rows}",
+            f"duplicates:{staging.num_rows - unseen.num_rows}",
+        ]
+        return str(job.payload["staging_uri"])
+
+    def _mark_stream_events_applied(self, job: JobRecord) -> None:
+        now = datetime.now(UTC)
+        records = self.session.scalars(
+            select(StreamEventRecord).where(
+                StreamEventRecord.job_id == job.id,
+                StreamEventRecord.state == StreamEventState.STAGED,
+            )
+        )
+        for record in records:
+            record.state = StreamEventState.APPLIED
+            record.applied_at = now
+            record.updated_at = now
+
+    def _unseen_rows(self, staging: pa.Table, target: str) -> pa.Table:
+        if "event_id" not in staging.column_names:
+            raise ValueError("offline append staging data is missing event_id")
+
+        existing_by_id: dict[str, str] = {}
+        if self.offline.exists(target):
+            existing = self.offline.load(target)
+            if "event_id" not in existing.column_names:
+                raise ValueError("offline feature view is missing event_id")
+            for row in existing.to_pylist():
+                event_id = str(row["event_id"])
+                fingerprint = self._canonical_row(row)
+                prior = existing_by_id.setdefault(event_id, fingerprint)
+                if prior != fingerprint:
+                    raise ValueError(
+                        f"offline feature view contains conflicting rows for event_id {event_id}"
+                    )
+
+        staged_by_id: dict[str, str] = {}
+        staged_unseen_ids: set[str] = set()
+        unseen: list[dict[str, Any]] = []
+        for row in staging.to_pylist():
+            event_id = str(row["event_id"])
+            fingerprint = self._canonical_row(row)
+            prior_staged = staged_by_id.setdefault(event_id, fingerprint)
+            if prior_staged != fingerprint:
+                raise ValueError(f"staging contains conflicting rows for event_id {event_id}")
+            if event_id in staged_unseen_ids:
+                continue
+            prior_existing = existing_by_id.get(event_id)
+            if prior_existing is not None:
+                if prior_existing != fingerprint:
+                    raise ValueError(
+                        f"event_id {event_id} conflicts with existing offline content"
+                    )
+                continue
+            unseen.append(row)
+            staged_unseen_ids.add(event_id)
+
+        return pa.Table.from_pylist(unseen, schema=staging.schema)
+
+    @classmethod
+    def _canonical_row(cls, row: dict[str, Any]) -> str:
+        def normalize(value: Any) -> Any:
+            if isinstance(value, datetime):
+                if value.tzinfo is None:
+                    return value.isoformat(timespec="microseconds")
+                return value.astimezone(UTC).isoformat(timespec="microseconds")
+            if isinstance(value, date):
+                return value.isoformat()
+            if isinstance(value, dict):
+                return {key: normalize(item) for key, item in sorted(value.items())}
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        return json.dumps(normalize(row), sort_keys=True, separators=(",", ":"), default=str)
 
     @staticmethod
     def _transform(sql: str, source: pa.Table) -> pa.Table:

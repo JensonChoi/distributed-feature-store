@@ -4,12 +4,12 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import JSON, BigInteger, DateTime, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from feature_store.config import get_settings
-from feature_store.models import JobStatus
+from feature_store.models import JobStatus, StreamEventState
 
 
 class Base(DeclarativeBase):
@@ -45,6 +45,32 @@ class JobRecord(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class StreamEventRecord(Base):
+    __tablename__ = "stream_events"
+    __table_args__ = (UniqueConstraint("feature_view", "event_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    feature_view: Mapped[str] = mapped_column(String(160), index=True)
+    event_id: Mapped[str] = mapped_column(String(256))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(
+        String(32), default=StreamEventState.PENDING, index=True
+    )
+    source_topic: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source_partition: Mapped[int | None] = mapped_column(nullable=True)
+    source_offset: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 def make_engine(database_url: str | None = None):  # type: ignore[no-untyped-def]
