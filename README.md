@@ -9,7 +9,7 @@ the registry and durable jobs.
 
 - Immutable, semantic feature versions and pinned feature services.
 - Point-in-time correct historical joins with TTL handling and deterministic ties.
-- Resumable daily backfills and explicit online materialization.
+- Leased, resumable jobs with heartbeats, fenced completion, and bounded retries.
 - Idempotent, out-of-order-safe online updates and durable offline stream ingestion.
 - One typed contract across the Python SDK, CLI, and REST API.
 

@@ -25,19 +25,17 @@ rows and continue to use the larger event ID as the serving tie-breaker.
 
 Ledger retention and compaction remain future operational work.
 
-## Near term: reliability and measurable behavior
-
 ### Job leases, heartbeats, and bounded retries
 
-Replace startup-only recovery of `running` jobs with explicit ownership leases and heartbeats.
-Add configurable retry limits, exponential backoff, and terminal failure classification so a
-poisoned job cannot retry forever or block useful work.
+Workers now claim jobs through expiring ownership leases and renew them from a separate
+database session. Lease tokens fence checkpoints, completion, failure, cancellation, and
+stream-ledger finalization so an expired worker cannot overwrite a new owner. Retryable
+failures use bounded exponential backoff and a snapshotted three-attempt budget, while
+deterministic failures terminate immediately and expired final attempts become `exhausted`.
+Operators can cancel queued, retrying, or running work and manually reset either failed or
+exhausted jobs.
 
-Completion signals:
-
-- Another worker can reclaim a job after its lease expires.
-- Multiple workers can claim jobs without executing the same job concurrently.
-- Operators can distinguish retryable, terminal, cancelled, and exhausted jobs.
+## Near term: reliability and measurable behavior
 
 ### Asynchronous historical retrieval
 

@@ -68,10 +68,25 @@ different content under an existing identity causes a conflict, while reapplying
 content is idempotent. Feature services provide pinned contracts composed of exact feature
 references such as `account_transaction_features@1.0.0:txn_count_1h`.
 
-The worker polls Postgres, claims pending work with row locking, and requeues interrupted jobs
-when it starts. Backfills are checkpointed in daily chunks. See
+Workers poll Postgres and claim pending work, due retries, or expired leases with row locking
+and an atomic ownership update. Each attempt receives a private lease token and a 30-second
+lease; a separate database session renews the lease every 10 seconds while execution is
+blocked. Checkpoints, completion, failure, and stream-ledger finalization are fenced by that
+token, so a worker that loses ownership cannot commit stale state.
+
+Retryable failures use bounded exponential backoff (5 seconds, then 10 seconds, capped at 60)
+and stop after the job's snapshotted three-attempt budget. Deterministic registry, payload,
+schema, Delta-content, Arrow-validation, and DuckDB-query failures terminate immediately.
+Expired final attempts become `exhausted`; operators may manually reset either `failed` or
+`exhausted` jobs. Backfills remain checkpointed in daily chunks. See
 [`registry.py`](../src/feature_store/registry.py), [`jobs.py`](../src/feature_store/jobs.py), and
 [`worker.py`](../src/feature_store/worker.py).
+
+Job API responses expose attempt counts, the next eligible attempt, worker ownership, lease
+expiry, last heartbeat, and failure classification; the lease token is private and never
+serialized. `started_at` is the latest attempt start, while `finished_at` is reserved for
+terminal states. Cancellation accepts pending, retrying, or running work, and manual retry
+accepts failed or exhausted work.
 
 ## Offline and batch path
 
@@ -130,15 +145,16 @@ The stream consumer subscribes to registry-defined Redpanda topics and:
    transaction.
 8. Commits Kafka offsets only after that transaction succeeds.
 9. Lets the worker append only event IDs not already present in the permanent Delta table.
-10. Marks the job successful and its ledger records `applied` in one database commit, then
-    performs best-effort staging cleanup.
+10. Marks the owning job successful and its ledger records `applied` in one lease-fenced
+    database commit, then performs best-effort staging cleanup.
 
 On startup the single supported consumer recovers every `pending` payload from the ledger,
 replays the idempotent Redis update, and stages it even if the original process failed before
 buffering. A crash after staging but before offset commit is safe because the replay observes a
-durable `staged` identity. Worker retries are also safe after a successful Delta write: existing
-canonically equivalent rows are skipped, while conflicting content fails the job. Ledger
-records are retained indefinitely in this first version. See
+durable `staged` identity. Worker retries and lease recovery are also safe after a successful
+Delta write: existing canonically equivalent rows are skipped, while conflicting content
+fails the job terminally. A stale worker cannot mark ledger rows `applied`. Ledger records are
+retained indefinitely in this first version. See
 [`ledger.py`](../src/feature_store/ledger.py), [`streaming.py`](../src/feature_store/streaming.py),
 and [`jobs.py`](../src/feature_store/jobs.py).
 
