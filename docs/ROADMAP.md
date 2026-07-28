@@ -11,19 +11,21 @@ correctness and operability before horizontal scale or a broader product surface
 - Keep service entry points thin and storage or execution engines replaceable.
 - Add operational complexity only when its failure modes can be tested locally.
 
-## Near term: reliability and measurable behavior
+## Delivered
 
 ### End-to-end streaming deduplication
 
-The Redis update path is replay-safe, but a consumer restart can stage the same event more than
-once for offline append. Give every accepted event a durable identity and make the staging and
-offline-append path idempotent across Kafka replays.
+Streaming events now have a durable identity scoped to `(feature_view, event_id)`. Postgres
+retains the canonical payload and its pending, staged, or applied lifecycle. Exact Kafka
+replays do not repeat Redis or Delta mutations, while conflicting reuse of an identity is sent
+to the dead-letter topic. Pending events recover on consumer startup, staging and job creation
+share one database transaction, and offline appends compare event IDs before writing so worker
+retries remain idempotent. Equal-timestamp events with distinct IDs remain separate historical
+rows and continue to use the larger event ID as the serving tie-breaker.
 
-Completion signals:
+Ledger retention and compaction remain future operational work.
 
-- Reprocessing an already committed event does not duplicate its offline row.
-- A crash between staging, job creation, and offset commit recovers without data loss.
-- Regression tests cover duplicate IDs, equal timestamps, and consumer restart boundaries.
+## Near term: reliability and measurable behavior
 
 ### Job leases, heartbeats, and bounded retries
 

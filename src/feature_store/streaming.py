@@ -5,6 +5,8 @@ import logging
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC
 from typing import Any
 
@@ -12,11 +14,13 @@ import pyarrow as pa
 from confluent_kafka import Consumer, KafkaError, Message, Producer
 from prometheus_client import Counter
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from feature_store.config import get_settings
-from feature_store.db import SessionLocal, init_db
+from feature_store.db import SessionLocal, StreamEventRecord, init_db
 from feature_store.jobs import JobService
-from feature_store.models import StreamFeatureEvent, validate_feature_value
+from feature_store.ledger import RegistrationResult, StreamEventLedger
+from feature_store.models import StreamEventState, StreamFeatureEvent, validate_feature_value
 from feature_store.observability import configure_logging
 from feature_store.offline import OfflineStore
 from feature_store.online import OnlineStore
@@ -26,6 +30,13 @@ logger = logging.getLogger(__name__)
 CONSUMED = Counter("feature_store_stream_events_total", "Stream events", ["result"])
 
 
+@dataclass
+class BufferedEvent:
+    record_id: str
+    event: StreamFeatureEvent
+    messages: list[Message] = field(default_factory=list)
+
+
 class StreamConsumer:
     def __init__(
         self,
@@ -33,17 +44,19 @@ class StreamConsumer:
         producer: Producer,
         offline: OfflineStore | None = None,
         online: OnlineStore | None = None,
+        session_factory: Callable[[], Session] = SessionLocal,
     ):
         self.consumer = consumer
         self.producer = producer
         self.offline = offline or OfflineStore()
         self.online = online or OnlineStore()
+        self.session_factory = session_factory
         self.settings = get_settings()
-        self.buffers: dict[str, list[tuple[StreamFeatureEvent, Message]]] = defaultdict(list)
+        self.buffers: dict[str, dict[str, BufferedEvent]] = defaultdict(dict)
         self.last_flush = time.monotonic()
 
     def subscribe(self) -> None:
-        with SessionLocal() as session:
+        with self.session_factory() as session:
             records = Registry(session).list_records("stream_source")
             topics = sorted({record["spec"]["topic"] for record in records})
         if not topics:
@@ -52,6 +65,7 @@ class StreamConsumer:
         logger.info("subscribed to %s", topics)
 
     def loop(self) -> None:
+        self.recover_pending()
         self.subscribe()
         try:
             while True:
@@ -78,7 +92,7 @@ class StreamConsumer:
             event = StreamFeatureEvent.model_validate(payload)
             if event.event_timestamp.tzinfo is None:
                 raise ValueError("event_timestamp must include a timezone")
-            with SessionLocal() as session:
+            with self.session_factory() as session:
                 registry = Registry(session)
                 view = registry.feature_view(event.feature_view)
                 if not view.stream_source:
@@ -97,18 +111,69 @@ class StreamConsumer:
                     )
                 for feature in view.features:
                     validate_feature_value(feature.dtype, event.values[feature.name])
-            self.online.upsert(event)
-            self.buffers[event.feature_view].append((event, message))
-            CONSUMED.labels("accepted").inc()
+                registration = StreamEventLedger(session).register(
+                    event,
+                    source_topic=message.topic(),
+                    source_partition=message.partition(),
+                    source_offset=message.offset(),
+                )
+            if registration.result == RegistrationResult.CONFLICT:
+                self._dead_letter(
+                    message,
+                    f"event identity {event.feature_view}:{event.event_id} "
+                    "was reused with different content",
+                )
+                self.flush()
+                self.consumer.commit(message=message, asynchronous=False)
+                CONSUMED.labels("dead_lettered").inc()
+                return
+            if registration.record.state != StreamEventState.PENDING:
+                self.flush()
+                self.consumer.commit(message=message, asynchronous=False)
+                CONSUMED.labels("duplicate").inc()
+                return
+
+            durable_event = StreamEventLedger.event(registration.record)
+            if self._buffer(registration.record.id, durable_event, message):
+                self.online.upsert(durable_event)
+            result = (
+                "accepted"
+                if registration.result == RegistrationResult.NEW
+                else "duplicate_pending"
+            )
+            CONSUMED.labels(result).inc()
         except (ValueError, ValidationError, json.JSONDecodeError) as exc:
             self._dead_letter(message, str(exc))
             self.flush()
             self.consumer.commit(message=message, asynchronous=False)
             CONSUMED.labels("dead_lettered").inc()
 
+    def recover_pending(self) -> int:
+        with self.session_factory() as session:
+            records = StreamEventLedger(session).pending()
+            for record in records:
+                event = StreamEventLedger.event(record)
+                if self._buffer(record.id, event):
+                    self.online.upsert(event)
+        if records:
+            self.flush()
+        return len(records)
+
+    def _buffer(
+        self, record_id: str, event: StreamFeatureEvent, message: Message | None = None
+    ) -> bool:
+        buffered = self.buffers[event.feature_view].get(event.event_id)
+        created = buffered is None
+        if buffered is None:
+            buffered = BufferedEvent(record_id=record_id, event=event)
+            self.buffers[event.feature_view][event.event_id] = buffered
+        if message is not None:
+            buffered.messages.append(message)
+        return created
+
     def _dead_letter(self, message: Message, error: str) -> None:
         topic = f"{message.topic()}.dlq"
-        with SessionLocal() as session:
+        with self.session_factory() as session:
             for record in Registry(session).list_records("stream_source"):
                 spec = record["spec"]
                 if spec["topic"] == message.topic() and spec.get("dead_letter_topic"):
@@ -123,7 +188,11 @@ class StreamConsumer:
         self.producer.flush(10)
 
     def _should_flush(self) -> bool:
-        count = sum(len(buffer) for buffer in self.buffers.values())
+        count = sum(
+            sum(max(1, len(item.messages)) for item in buffer.values())
+            for buffer in self.buffers.values()
+            if buffer
+        )
         return count >= self.settings.stream_batch_size or (
             count > 0 and time.monotonic() - self.last_flush >= self.settings.stream_flush_seconds
         )
@@ -133,20 +202,20 @@ class StreamConsumer:
         for view_ref, buffer in list(self.buffers.items()):
             if not buffer:
                 continue
-            self._flush_view(view_ref, buffer)
-            staged_messages.extend(message for _, message in buffer)
-            self.buffers[view_ref] = []
+            staged_messages.extend(self._flush_view(view_ref, list(buffer.values())))
+            self.buffers[view_ref] = {}
         self._commit_latest(staged_messages)
         self.last_flush = time.monotonic()
 
-    def _flush_view(self, view_ref: str, buffer: list[tuple[StreamFeatureEvent, Message]]) -> None:
-        with SessionLocal() as session:
+    def _flush_view(self, view_ref: str, buffer: list[BufferedEvent]) -> list[Message]:
+        with self.session_factory() as session:
             registry = Registry(session)
             view = registry.feature_view(view_ref)
             entity = registry.entity(view.entity)
             feature_names = [feature.name for feature in view.features]
             rows: list[dict[str, Any]] = []
-            for event, _ in buffer:
+            for item in buffer:
+                event = item.event
                 timestamp = event.event_timestamp.astimezone(UTC)
                 rows.append(
                     {
@@ -163,9 +232,20 @@ class StreamConsumer:
                 f"{uuid.uuid4()}"
             )
             self.offline.append(staging_uri, table, partition_by="event_date")
-            JobService(session).create_offline_append(view_ref, staging_uri)
+            records = list(
+                session.query(StreamEventRecord).filter(
+                    StreamEventRecord.id.in_([item.record_id for item in buffer]),
+                    StreamEventRecord.state == StreamEventState.PENDING,
+                )
+            )
+            if len(records) != len(buffer):
+                raise RuntimeError("stream event state changed before staging")
+            job = JobService(session).create_offline_append(view_ref, staging_uri, commit=False)
+            StreamEventLedger(session).mark_staged(records, job.id)
+            session.commit()
 
         logger.info("staged %d events for %s", len(buffer), view_ref)
+        return [message for item in buffer for message in item.messages]
 
     def _commit_latest(self, messages: list[Message]) -> None:
         latest_by_partition: dict[tuple[str, int], Message] = {}

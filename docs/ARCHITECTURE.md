@@ -36,7 +36,8 @@ CLI / Python SDK ────> │ FastAPI ─────> Postgres            
 ┌──────────────────────────┴── Streaming path ───────────────────┐
 │ Feature producer ──> Redpanda ──> Stream consumer              │
 │                                      │                         │
-│                                      ├── validate + Redis      │
+│                                      ├── validate + ledger     │
+│                                      ├── idempotent Redis      │
 │                                      ├── stage batch on MinIO  │
 │                                      ├── enqueue offline append│
 │                                      └── invalid events → DLQ  │
@@ -55,11 +56,12 @@ offline store, historical retriever, and job service. The relevant implementatio
 
 ## Registry and job control plane
 
-Postgres stores two kinds of state:
+Postgres stores three kinds of state:
 
 - Immutable registry records for entities, batch sources, stream sources, feature views, and
   feature services.
 - Durable backfill, materialization, and offline-append jobs, including status and checkpoints.
+- A durable stream-event ledger keyed by feature view and event ID.
 
 Feature views have semantic identities such as `account_transaction_features@1.0.0`. Applying
 different content under an existing identity causes a conflict, while reapplying identical
@@ -118,15 +120,27 @@ The stream consumer subscribes to registry-defined Redpanda topics and:
 
 1. Parses and validates each event against its pinned feature view.
 2. Sends malformed or schema-invalid events to a dead-letter topic.
-3. Atomically updates Redis.
-4. Buffers accepted events by feature view.
-5. Writes each batch to a unique staging Delta table in MinIO.
-6. Creates a durable `offline_append` job in Postgres.
-7. Commits Kafka offsets after staging and job creation.
-8. Lets the worker append staging data to the permanent offline view and clean up staging.
+3. Registers the canonical payload as `pending` in Postgres before updating Redis.
+4. Ignores an exact durable duplicate, or dead-letters conflicting content that reuses the same
+   `(feature_view, event_id)`.
+5. Atomically updates Redis and buffers one payload per durable identity while retaining all
+   Kafka messages whose offsets must be committed.
+6. Writes each batch to a unique staging Delta table in MinIO.
+7. Creates an `offline_append` job and marks its ledger records `staged` in one Postgres
+   transaction.
+8. Commits Kafka offsets only after that transaction succeeds.
+9. Lets the worker append only event IDs not already present in the permanent Delta table.
+10. Marks the job successful and its ledger records `applied` in one database commit, then
+    performs best-effort staging cleanup.
 
-This path keeps online features fresh while eventually adding the same events to historical
-storage. See [`streaming.py`](../src/feature_store/streaming.py).
+On startup the single supported consumer recovers every `pending` payload from the ledger,
+replays the idempotent Redis update, and stages it even if the original process failed before
+buffering. A crash after staging but before offset commit is safe because the replay observes a
+durable `staged` identity. Worker retries are also safe after a successful Delta write: existing
+canonically equivalent rows are skipped, while conflicting content fails the job. Ledger
+records are retained indefinitely in this first version. See
+[`ledger.py`](../src/feature_store/ledger.py), [`streaming.py`](../src/feature_store/streaming.py),
+and [`jobs.py`](../src/feature_store/jobs.py).
 
 ## Materialization
 
