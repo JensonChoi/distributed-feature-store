@@ -4,16 +4,19 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import redis
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from feature_store.artifacts import ArtifactStorage
 from feature_store.config import get_settings
 from feature_store.db import SessionLocal, init_db
 from feature_store.jobs import JobService, serialize_job
@@ -22,6 +25,7 @@ from feature_store.models import (
     HistoricalQuery,
     JobKind,
     JobRequest,
+    JobResponse,
     OnlineQuery,
     QueryResponse,
     RegistryManifest,
@@ -41,6 +45,10 @@ LATENCY = Histogram("feature_store_http_request_seconds", "HTTP request duration
 def get_session() -> Any:
     with SessionLocal() as session:
         yield session
+
+
+def get_artifact_storage() -> ArtifactStorage:
+    return ArtifactStorage()
 
 
 @asynccontextmanager
@@ -127,18 +135,21 @@ def online_read(query: OnlineQuery, session: Session = Depends(get_session)) -> 
     )
 
 
-@app.post("/v1/historical-features:query", response_model=QueryResponse)
+@app.post("/v1/historical-features:query", response_model=QueryResponse | JobResponse)
 def historical_query(
-    query: HistoricalQuery, session: Session = Depends(get_session)
-) -> QueryResponse:
+    query: HistoricalQuery,
+    session: Session = Depends(get_session),
+    artifacts: ArtifactStorage = Depends(get_artifact_storage),
+) -> QueryResponse | JSONResponse:
+    retriever = HistoricalRetriever(Registry(session), OfflineStore())
     if len(query.observations) > get_settings().inline_query_limit:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"inline query limit is {get_settings().inline_query_limit} rows",
+        resolved = retriever.validate(query.observations, query.features, query.feature_service)
+        job = JobService(session).create_historical_query(query, resolved, artifacts)
+        return JSONResponse(
+            status_code=202,
+            content=jsonable_encoder(JobResponse.model_validate(serialize_job(job))),
         )
-    return HistoricalRetriever(Registry(session), OfflineStore()).query(
-        query.observations, query.features, query.feature_service
-    )
+    return retriever.query(query.observations, query.features, query.feature_service)
 
 
 @app.post("/v1/jobs/backfills", status_code=202)
@@ -166,6 +177,38 @@ def get_job(job_id: str, session: Session = Depends(get_session)) -> dict[str, A
         return serialize_job(JobService(session).get(job_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+
+
+@app.get("/v1/jobs/{job_id}/result")
+def get_job_result(
+    job_id: str,
+    session: Session = Depends(get_session),
+    artifacts: ArtifactStorage = Depends(get_artifact_storage),
+) -> StreamingResponse:
+    try:
+        job = JobService(session).get(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+    expires_at = job.artifact_expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if job.artifacts_cleaned_at is not None or (
+        expires_at is not None and expires_at <= datetime.now(UTC)
+    ):
+        raise HTTPException(status_code=410, detail="job result has expired")
+    if job.status != "succeeded" or not job.result_uri or not job.result_metadata:
+        raise HTTPException(status_code=409, detail="job has no completed downloadable result")
+    if not artifacts.exists(job.result_uri):
+        raise HTTPException(status_code=409, detail="job result artifact is unavailable")
+    filename = f"historical-query-{job.id}.parquet"
+    return StreamingResponse(
+        artifacts.iter_bytes(job.result_uri),
+        media_type=str(job.result_metadata["content_type"]),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(job.result_metadata["byte_size"]),
+        },
+    )
 
 
 @app.post("/v1/jobs/{job_id}:cancel")

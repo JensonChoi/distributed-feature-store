@@ -97,5 +97,12 @@ def job_retry(job_id: str) -> None:
         _print(client.retry_job(job_id))
 
 
+@app.command("job-result")
+def job_result(job_id: str, output: Path) -> None:
+    with FeatureStoreClient() as client:
+        path = client.download_job_result(job_id, output)
+    _print({"job_id": job_id, "output": str(path)})
+
+
 if __name__ == "__main__":
     app()

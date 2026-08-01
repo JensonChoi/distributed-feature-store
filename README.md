@@ -9,6 +9,7 @@ the registry and durable jobs.
 
 - Immutable, semantic feature versions and pinned feature services.
 - Point-in-time correct historical joins with TTL handling and deterministic ties.
+- Inline and durable historical retrieval with streamed Parquet results.
 - Leased, resumable jobs with heartbeats, fenced completion, and bounded retries.
 - Idempotent, out-of-order-safe online updates and durable offline stream ingestion.
 - One typed contract across the Python SDK, CLI, and REST API.
@@ -48,6 +49,23 @@ Feature views have exact `name@major.minor.patch` identities. Historical queries
 services must pin exact feature references such as
 `account_transaction_features@1.0.0:txn_count_1h`. Applying a changed definition under an
 existing identity returns a conflict.
+
+Historical requests containing at most `FS_INLINE_QUERY_LIMIT` observations return rows inline.
+Larger requests return a `historical_query` job after their feature selectors and entity keys
+have been validated. Poll the job and download its Parquet result when it succeeds:
+
+```bash
+uv run feature-store historical-read observations.json \
+  -f account_transaction_features@1.0.0:txn_count_1h
+uv run feature-store job JOB_ID
+uv run feature-store job-result JOB_ID training-data.parquet
+```
+
+The download is streamed through the API; raw MinIO locations are not exposed. Query inputs and
+results are retained for `FS_HISTORICAL_RESULT_TTL_SECONDS` (24 hours by default). The worker
+deletes expired artifact prefixes every `FS_ARTIFACT_CLEANUP_INTERVAL_SECONDS`; durable job and
+result metadata remain available after cleanup. Failed or exhausted jobs may be retried only
+before their artifacts expire.
 
 ## Point-in-time semantics
 

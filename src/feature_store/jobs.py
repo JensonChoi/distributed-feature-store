@@ -17,10 +17,12 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
+from feature_store.artifacts import ArtifactStorage
 from feature_store.config import Settings, get_settings
 from feature_store.db import JobRecord, StreamEventRecord
 from feature_store.models import (
     Feature,
+    HistoricalQuery,
     JobFailureKind,
     JobKind,
     JobRequest,
@@ -31,6 +33,7 @@ from feature_store.models import (
 )
 from feature_store.offline import OfflineStore, normalize_uri
 from feature_store.online import OnlineStore
+from feature_store.pit import HistoricalRetriever
 from feature_store.registry import Registry, RegistryConflictError, RegistryNotFoundError
 
 
@@ -38,7 +41,19 @@ class LeaseLostError(RuntimeError):
     """The worker no longer owns the job and must not persist execution state."""
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def serialize_job(job: JobRecord) -> dict[str, Any]:
+    result = None
+    if job.result_metadata and job.artifact_expires_at:
+        result = {
+            **job.result_metadata,
+            "download_url": f"/v1/jobs/{job.id}/result",
+            "expires_at": job.artifact_expires_at,
+            "cleaned_up": job.artifacts_cleaned_at is not None,
+        }
     return {
         "id": job.id,
         "kind": job.kind,
@@ -56,6 +71,9 @@ def serialize_job(job: JobRecord) -> dict[str, Any]:
         "created_at": job.created_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
+        "artifact_expires_at": job.artifact_expires_at,
+        "artifacts_cleaned_at": job.artifacts_cleaned_at,
+        "result": result,
     }
 
 
@@ -96,6 +114,38 @@ class JobService:
             self.session.flush()
         return job
 
+    def create_historical_query(
+        self,
+        query: HistoricalQuery,
+        resolved_features: list[str],
+        artifacts: ArtifactStorage,
+    ) -> JobRecord:
+        job_id = str(uuid.uuid4())
+        artifact_uri = artifacts.input_uri(job_id)
+        artifacts.write_json(artifact_uri, query.model_dump(mode="json"))
+        job = JobRecord(
+            id=job_id,
+            kind=JobKind.HISTORICAL_QUERY,
+            status=JobStatus.PENDING,
+            payload={
+                "observation_count": len(query.observations),
+                "resolved_features": resolved_features,
+            },
+            artifact_uri=artifact_uri,
+            checkpoints=[],
+            max_attempts=self.settings.job_max_attempts,
+        )
+        try:
+            self.session.add(job)
+            self.session.commit()
+            self.session.refresh(job)
+        except Exception:
+            self.session.rollback()
+            with suppress(Exception):
+                artifacts.delete_job(job_id)
+            raise
+        return job
+
     def get(self, job_id: str) -> JobRecord:
         job = self.session.get(JobRecord, job_id)
         if not job:
@@ -110,6 +160,7 @@ class JobService:
         job = self.get(job_id)
         if job.status not in (JobStatus.PENDING, JobStatus.RETRYING, JobStatus.RUNNING):
             raise ValueError("only pending, retrying, or running jobs can be cancelled")
+        now = datetime.now(UTC)
         result = cast(
             CursorResult[Any],
             self.session.execute(
@@ -123,7 +174,12 @@ class JobService:
                 )
                 .values(
                     status=JobStatus.CANCELLED,
-                    finished_at=datetime.now(UTC),
+                    finished_at=now,
+                    artifact_expires_at=(
+                        now + timedelta(seconds=self.settings.historical_result_ttl_seconds)
+                        if job.kind == JobKind.HISTORICAL_QUERY
+                        else job.artifact_expires_at
+                    ),
                     next_attempt_at=None,
                     worker_id=None,
                     lease_token=None,
@@ -142,8 +198,18 @@ class JobService:
 
     def retry(self, job_id: str) -> JobRecord:
         job = self.get(job_id)
-        if job.status not in (JobStatus.FAILED, JobStatus.EXHAUSTED):
+        retryable_statuses = (JobStatus.FAILED, JobStatus.EXHAUSTED)
+        retryable_cancelled_query = (
+            job.status == JobStatus.CANCELLED and job.kind == JobKind.HISTORICAL_QUERY
+        )
+        if job.status not in retryable_statuses and not retryable_cancelled_query:
             raise ValueError("only failed or exhausted jobs can be retried")
+        now = datetime.now(UTC)
+        expires_at = job.artifact_expires_at
+        if job.artifacts_cleaned_at is not None or (
+            expires_at is not None and _as_utc(expires_at) <= now
+        ):
+            raise ValueError("job artifacts have expired and the job cannot be retried")
         result = cast(
             CursorResult[Any],
             self.session.execute(
@@ -151,7 +217,9 @@ class JobService:
                 .execution_options(synchronize_session=False)
                 .where(
                     JobRecord.id == job_id,
-                    JobRecord.status.in_((JobStatus.FAILED, JobStatus.EXHAUSTED)),
+                    JobRecord.status.in_(
+                        (JobStatus.FAILED, JobStatus.EXHAUSTED, JobStatus.CANCELLED)
+                    ),
                 )
                 .values(
                     status=JobStatus.PENDING,
@@ -166,6 +234,10 @@ class JobService:
                     last_heartbeat_at=None,
                     started_at=None,
                     finished_at=None,
+                    artifact_expires_at=None,
+                    artifacts_cleaned_at=None,
+                    result_uri=None,
+                    result_metadata=None,
                 )
             ),
         )
@@ -184,6 +256,7 @@ class JobExecutor:
         session: Session,
         offline: OfflineStore | None = None,
         online: OnlineStore | None = None,
+        artifacts: ArtifactStorage | None = None,
         *,
         worker_id: str | None = None,
         settings: Settings | None = None,
@@ -196,6 +269,7 @@ class JobExecutor:
         self.registry = Registry(session)
         self.offline = offline or OfflineStore()
         self.online = online or OnlineStore()
+        self.artifacts = artifacts or ArtifactStorage(self.settings)
 
     def claim_next(
         self, worker_id: str | None = None, *, now: datetime | None = None
@@ -256,6 +330,12 @@ class JobExecutor:
                                 else "job attempt budget was exhausted"
                             ),
                             finished_at=claimed_at,
+                            artifact_expires_at=(
+                                claimed_at
+                                + timedelta(seconds=self.settings.historical_result_ttl_seconds)
+                                if candidate.kind == JobKind.HISTORICAL_QUERY
+                                else candidate.artifact_expires_at
+                            ),
                             next_attempt_at=None,
                             worker_id=None,
                             lease_token=None,
@@ -337,6 +417,8 @@ class JobExecutor:
             return
         lease_token = job.lease_token
         cleanup_uri: str | None = None
+        attempt_result_uri: str | None = None
+        result_metadata: dict[str, Any] | None = None
         try:
             if job.kind == JobKind.BACKFILL:
                 self._backfill(job, lease_token)
@@ -344,9 +426,17 @@ class JobExecutor:
                 self._materialize(job, lease_token)
             elif job.kind == JobKind.OFFLINE_APPEND:
                 cleanup_uri = self._offline_append(job, lease_token)
+            elif job.kind == JobKind.HISTORICAL_QUERY:
+                attempt_result_uri, result_metadata = self._historical_query(job, lease_token)
             else:
                 raise ValueError(f"unsupported job kind: {job.kind}")
-            self._finalize_success(job, lease_token)
+            self._finalize_success(
+                job,
+                lease_token,
+                result_uri=attempt_result_uri,
+                result_metadata=result_metadata,
+            )
+            attempt_result_uri = None
         except LeaseLostError:
             self.session.rollback()
             with suppress(Exception):
@@ -357,6 +447,10 @@ class JobExecutor:
             self.session.rollback()
             self._finalize_failure(job, lease_token, exc, error)
             return
+        finally:
+            if attempt_result_uri:
+                with suppress(Exception):
+                    self.artifacts.delete(attempt_result_uri)
         if cleanup_uri:
             with suppress(Exception):
                 self.offline.delete(cleanup_uri)
@@ -405,7 +499,14 @@ class JobExecutor:
         self.session.commit()
         self.session.refresh(job)
 
-    def _finalize_success(self, job: JobRecord, lease_token: str) -> None:
+    def _finalize_success(
+        self,
+        job: JobRecord,
+        lease_token: str,
+        *,
+        result_uri: str | None = None,
+        result_metadata: dict[str, Any] | None = None,
+    ) -> None:
         now = self.now()
         result = cast(
             CursorResult[Any],
@@ -428,6 +529,13 @@ class JobExecutor:
                     lease_token=None,
                     lease_expires_at=None,
                     last_heartbeat_at=None,
+                    result_uri=result_uri,
+                    result_metadata=result_metadata,
+                    artifact_expires_at=(
+                        now + timedelta(seconds=self.settings.historical_result_ttl_seconds)
+                        if job.kind == JobKind.HISTORICAL_QUERY
+                        else job.artifact_expires_at
+                    ),
                 )
             ),
         )
@@ -463,6 +571,11 @@ class JobExecutor:
             )
             next_attempt_at = now + timedelta(seconds=delay)
             finished_at = None
+        artifact_expires_at = (
+            now + timedelta(seconds=self.settings.historical_result_ttl_seconds)
+            if job.kind == JobKind.HISTORICAL_QUERY and finished_at is not None
+            else None
+        )
         result = cast(
             CursorResult[Any],
             self.session.execute(
@@ -484,6 +597,7 @@ class JobExecutor:
                     lease_token=None,
                     lease_expires_at=None,
                     last_heartbeat_at=None,
+                    artifact_expires_at=artifact_expires_at,
                 )
             ),
         )
@@ -494,6 +608,67 @@ class JobExecutor:
             return
         self.session.commit()
         self.session.refresh(job)
+
+    def _historical_query(
+        self, job: JobRecord, lease_token: str
+    ) -> tuple[str, dict[str, Any]]:
+        if not job.artifact_uri:
+            raise ValueError("historical query job is missing its input artifact")
+        payload = self.artifacts.read_json(job.artifact_uri)
+        query = HistoricalQuery.model_validate(payload)
+        resolved = list(job.payload["resolved_features"])
+        self._require_ownership(job, lease_token)
+        table = HistoricalRetriever(self.registry, self.offline).query_table(
+            query.observations, resolved_features=resolved
+        )
+        self._require_ownership(job, lease_token)
+        uri = self.artifacts.result_uri(job.id, job.attempt_count, lease_token)
+        size = self.artifacts.write_parquet(uri, table)
+        return uri, {
+            "format": "parquet",
+            "content_type": "application/vnd.apache.parquet",
+            "row_count": table.num_rows,
+            "byte_size": size,
+            "resolved_features": resolved,
+        }
+
+    def cleanup_expired_artifacts(self, *, now: datetime | None = None) -> int:
+        cleaned_at = now or self.now()
+        terminal = (
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.EXHAUSTED,
+            JobStatus.CANCELLED,
+        )
+        jobs = list(
+            self.session.scalars(
+                select(JobRecord)
+                .where(
+                    JobRecord.kind == JobKind.HISTORICAL_QUERY,
+                    JobRecord.status.in_(terminal),
+                    JobRecord.artifact_expires_at.is_not(None),
+                    JobRecord.artifact_expires_at <= cleaned_at,
+                    JobRecord.artifacts_cleaned_at.is_(None),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        )
+        count = 0
+        for job in jobs:
+            self.artifacts.delete_job(job.id)
+            result = cast(
+                CursorResult[Any],
+                self.session.execute(
+                    update(JobRecord)
+                    .execution_options(synchronize_session=False)
+                    .where(JobRecord.id == job.id, JobRecord.artifacts_cleaned_at.is_(None))
+                    .values(artifacts_cleaned_at=cleaned_at)
+                ),
+            )
+            count += int(result.rowcount or 0)
+        self.session.commit()
+        self.session.expire_all()
+        return count
 
     @staticmethod
     def _is_terminal_failure(exc: Exception) -> bool:
