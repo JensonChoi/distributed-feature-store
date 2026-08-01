@@ -43,9 +43,19 @@ def run() -> None:
     init_db()
     worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     logger.info("worker started", extra={"worker_id": worker_id})
+    last_cleanup = 0.0
     while True:
         with SessionLocal() as session:
             executor = JobExecutor(session, worker_id=worker_id, settings=settings)
+            current = time.monotonic()
+            if current - last_cleanup >= settings.artifact_cleanup_interval_seconds:
+                try:
+                    cleaned = executor.cleanup_expired_artifacts()
+                    if cleaned:
+                        logger.info("expired job artifacts cleaned", extra={"count": cleaned})
+                except Exception:
+                    logger.exception("artifact cleanup sweep failed")
+                last_cleanup = current
             job = executor.claim_next()
             if job:
                 logger.info(

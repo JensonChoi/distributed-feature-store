@@ -182,6 +182,7 @@ class JobKind(StrEnum):
     BACKFILL = "backfill"
     MATERIALIZE = "materialize"
     OFFLINE_APPEND = "offline_append"
+    HISTORICAL_QUERY = "historical_query"
 
 
 class JobStatus(StrEnum):
@@ -272,6 +273,39 @@ class QueryStatus(StrEnum):
 class QueryResponse(StrictModel):
     resolved_features: list[str]
     rows: list[dict[str, Any]]
+
+
+class HistoricalResult(StrictModel):
+    format: Literal["parquet"] = "parquet"
+    content_type: str = "application/vnd.apache.parquet"
+    row_count: int
+    byte_size: int
+    resolved_features: list[str]
+    download_url: str
+    expires_at: datetime
+    cleaned_up: bool = False
+
+
+class JobResponse(StrictModel):
+    id: str
+    kind: JobKind
+    status: JobStatus
+    payload: dict[str, Any]
+    checkpoints: list[str]
+    error: str | None
+    failure_kind: JobFailureKind | None
+    attempt_count: int
+    max_attempts: int
+    next_attempt_at: datetime | None
+    worker_id: str | None
+    lease_expires_at: datetime | None
+    last_heartbeat_at: datetime | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    artifact_expires_at: datetime | None = None
+    artifacts_cleaned_at: datetime | None = None
+    result: HistoricalResult | None = None
 
 
 JsonObject = dict[str, Any]

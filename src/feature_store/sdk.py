@@ -12,6 +12,7 @@ from feature_store.models import (
     ApplyResult,
     HistoricalQuery,
     JobRequest,
+    JobResponse,
     Observation,
     OnlineQuery,
     QueryResponse,
@@ -76,7 +77,7 @@ class FeatureStoreClient:
         *,
         features: list[str] | None = None,
         feature_service: str | None = None,
-    ) -> QueryResponse:
+    ) -> QueryResponse | JobResponse:
         parsed = [Observation.model_validate(item) for item in observations]
         query = HistoricalQuery(
             observations=parsed, features=features or [], feature_service=feature_service
@@ -85,7 +86,20 @@ class FeatureStoreClient:
             "/v1/historical-features:query", json=query.model_dump(mode="json")
         )
         response.raise_for_status()
+        if response.status_code == 202:
+            return JobResponse.model_validate(response.json())
         return QueryResponse.model_validate(response.json())
+
+    def download_job_result(
+        self, job_id: str, output: str | Path, *, chunk_size: int = 1024 * 1024
+    ) -> Path:
+        path = Path(output)
+        with self._client.stream("GET", f"/v1/jobs/{job_id}/result") as response:
+            response.raise_for_status()
+            with path.open("wb") as destination:
+                for chunk in response.iter_bytes(chunk_size=chunk_size):
+                    destination.write(chunk)
+        return path
 
     def backfill(self, feature_view: str, start: datetime, end: datetime) -> dict[str, Any]:
         return self._create_job("backfills", feature_view, start, end)

@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     offline_bucket: str = "feature-store"
     api_url: str = "http://localhost:8000"
     inline_query_limit: int = 10_000
+    historical_result_ttl_seconds: int = 86_400
+    artifact_cleanup_interval_seconds: int = 60
     job_poll_seconds: float = 1.0
     job_lease_seconds: int = 30
     job_heartbeat_seconds: int = 10

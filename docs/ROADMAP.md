@@ -35,19 +35,19 @@ deterministic failures terminate immediately and expired final attempts become `
 Operators can cancel queued, retrying, or running work and manually reset either failed or
 exhausted jobs.
 
-## Near term: reliability and measurable behavior
-
 ### Asynchronous historical retrieval
 
-Keep small interactive queries inline, but execute large historical requests as durable jobs.
-Write results to a versioned object-store location and expose status, metadata, and a download
-reference through the API and SDK.
+Historical requests at or below the configured inline limit still return rows immediately.
+Larger validated requests are staged in object storage and run as durable jobs. Each attempt
+writes a unique Parquet object, and the lease token fences publication so a stale worker cannot
+replace the downloadable result. The API streams completed Parquet files without buffering the
+whole result.
 
-Completion signals:
+Inputs and results expire together after the configured retention period. Workers delete the
+complete job prefix during periodic, idempotent cleanup sweeps while retaining job metadata.
+Failed, exhausted, and cancelled inputs remain retryable until they expire.
 
-- Requests above the inline limit can complete asynchronously.
-- Large results are streamed or written without loading the full result into API memory.
-- Cancellation, retry, expiration, and cleanup behavior are documented and tested.
+## Near term: reliability and measurable behavior
 
 ### Incremental materialization
 

@@ -59,6 +59,15 @@ class JobRecord(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    artifact_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_uri: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    artifact_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    artifacts_cleaned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class StreamEventRecord(Base):

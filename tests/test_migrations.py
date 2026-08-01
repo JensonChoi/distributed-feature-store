@@ -75,3 +75,46 @@ def test_job_lease_migration_preserves_existing_jobs_and_downgrades_sqlite(
     assert "stream_events" in inspect(engine).get_table_names()
     engine.dispose()
     get_settings.cache_clear()
+
+
+def test_historical_artifact_migration_preserves_jobs_and_downgrades_sqlite(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    database_path = tmp_path / "historical-artifacts.db"
+    database_url = f"sqlite:///{database_path}"
+    monkeypatch.setenv("FS_DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = Config("alembic.ini")
+    command.upgrade(config, "0003")
+    engine = make_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO jobs (id, kind, status, payload, checkpoints, created_at, "
+                "attempt_count, max_attempts) VALUES "
+                "('existing', 'backfill', 'pending', '{}', '[]', "
+                "'2025-01-01 00:00:00', 0, 3)"
+            )
+        )
+
+    command.upgrade(config, "0004")
+    columns = {column["name"] for column in inspect(engine).get_columns("jobs")}
+    assert {
+        "artifact_uri",
+        "result_uri",
+        "result_metadata",
+        "artifact_expires_at",
+        "artifacts_cleaned_at",
+    } <= columns
+    with engine.connect() as connection:
+        existing = connection.execute(
+            text("SELECT id FROM jobs WHERE id = 'existing'")
+        ).scalar()
+    assert existing == "existing"
+
+    command.downgrade(config, "0003")
+    columns = {column["name"] for column in inspect(engine).get_columns("jobs")}
+    assert "artifact_uri" not in columns
+    assert "attempt_count" in columns
+    engine.dispose()
+    get_settings.cache_clear()

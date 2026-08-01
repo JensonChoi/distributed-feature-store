@@ -16,8 +16,9 @@ CLI / Python SDK ────> │ FastAPI ─────> Postgres            
         ┌──────────────────────┘                 ▼
         │                                 Background worker
         │                                  • backfill
-        │                                  • materialize
-        │                                  • offline append
+│                                  • materialize
+│                                  • offline append
+│                                  • historical query
         │
 ┌───────▼──────── Offline path ───────────────────────────────────┐
 │ Batch source on MinIO                                          │
@@ -60,7 +61,8 @@ Postgres stores three kinds of state:
 
 - Immutable registry records for entities, batch sources, stream sources, feature views, and
   feature services.
-- Durable backfill, materialization, and offline-append jobs, including status and checkpoints.
+- Durable backfill, materialization, offline-append, and historical-query jobs, including status,
+  checkpoints, and private artifact references.
 - A durable stream-event ledger keyed by feature view and event ID.
 
 Feature views have semantic identities such as `account_transaction_features@1.0.0`. Applying
@@ -112,9 +114,17 @@ joins observations to offline feature rows by:
 - Using event ID as the deterministic tie-breaker.
 - Returning null feature values with `missing` or `expired` status when appropriate.
 
-Timestamps must include a timezone and are normalized to UTC at system boundaries. Inline API
-queries are limited to 10,000 observations. Retrieval currently runs synchronously inside the
-API rather than through a distributed batch engine. See
+Timestamps must include a timezone and are normalized to UTC at system boundaries. Queries at
+or below 10,000 observations run synchronously. Larger requests resolve their feature contract
+and entity keys before the API stages JSON input and creates a durable job. Workers write each
+attempt to a unique Parquet object and publish its metadata only while holding the job lease.
+Clients download successful results through the API as a streamed Parquet response; object-store
+URIs remain private.
+
+Inputs and results have a shared 24-hour default retention period. A periodic worker sweep
+deletes the whole artifact prefix after expiry and records cleanup while preserving the job and
+result metadata. Failed, exhausted, and cancelled jobs retain their input for the same period,
+and manual retry is rejected once the artifacts expire. See
 [`pit.py`](../src/feature_store/pit.py).
 
 ## Online serving

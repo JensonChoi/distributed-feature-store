@@ -27,9 +27,35 @@ class HistoricalRetriever:
         features: list[str],
         feature_service: str | None = None,
     ) -> QueryResponse:
+        resolved = self.validate(observations, features, feature_service)
+        table = self.query_table(observations, resolved_features=resolved)
+        return QueryResponse(resolved_features=resolved, rows=table.to_pylist())
+
+    def validate(
+        self,
+        observations: list[Observation],
+        features: list[str],
+        feature_service: str | None = None,
+    ) -> list[str]:
         resolved = self.registry.resolve_features(features, feature_service)
+        for ref in resolved:
+            view_ref, _ = ref.rsplit(":", 1)
+            view = self.registry.feature_view(view_ref)
+            entity = self.registry.entity(view.entity)
+            for index, observation in enumerate(observations):
+                missing = set(entity.join_keys) - set(observation.entity_values)
+                if missing:
+                    raise ValueError(
+                        f"missing observation entity keys at row {index}: {sorted(missing)}"
+                    )
+        return resolved
+
+    def query_table(
+        self, observations: list[Observation], *, resolved_features: list[str]
+    ) -> pa.Table:
+        resolved = resolved_features
         if not observations:
-            return QueryResponse(resolved_features=resolved, rows=[])
+            return pa.Table.from_pylist([])
         rows = []
         for index, observation in enumerate(observations):
             if observation.event_timestamp.tzinfo is None:
@@ -66,7 +92,7 @@ class HistoricalRetriever:
             )
 
         final = current.drop(["_row_id"])
-        return QueryResponse(resolved_features=resolved, rows=final.to_pylist())
+        return final
 
     def _join_view(
         self,
