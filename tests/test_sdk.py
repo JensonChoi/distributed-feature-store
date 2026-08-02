@@ -104,3 +104,30 @@ def test_sdk_streams_job_result_to_file(tmp_path: Path) -> None:
         returned = client.download_job_result("job-1", output, chunk_size=3)
     assert returned == output
     assert output.read_bytes() == content
+
+
+def test_sdk_incremental_materialization_contract() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(202, json={"id": "job-1"})
+
+    with FeatureStoreClient(
+        "http://feature-store", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = client.materialize_incremental(
+            "account_stats@1.0.0",
+            end=datetime(2025, 1, 2, tzinfo=UTC),
+            lookback_seconds=120,
+        )
+    assert result == {"id": "job-1"}
+    assert captured == {
+        "path": "/v1/jobs/materializations:incremental",
+        "body": {
+            "feature_view": "account_stats@1.0.0",
+            "end": "2025-01-02T00:00:00Z",
+            "lookback_seconds": 120,
+        },
+    }

@@ -6,7 +6,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.fs as pafs
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
@@ -27,14 +26,13 @@ class OfflineStore:
         return table.to_pyarrow_table()
 
     def load_range(
-        self, uri: str, timestamp_field: str, start: datetime, end: datetime
+        self, uri: str, timestamp_field: str, start: datetime | None, end: datetime
     ) -> pa.Table:
-        table = self.load(uri)
-        mask = pc.and_(
-            pc.greater_equal(table[timestamp_field], pa.scalar(start)),
-            pc.less(table[timestamp_field], pa.scalar(end)),
-        )
-        return table.filter(mask)
+        filters: list[tuple[str, str, Any]] = [(timestamp_field, "<", end)]
+        if start is not None:
+            filters.insert(0, (timestamp_field, ">=", start))
+        table = DeltaTable(uri, storage_options=self._options(uri))
+        return table.to_pyarrow_table(filters=filters)
 
     def append(self, uri: str, table: pa.Table, partition_by: str | None = None) -> None:
         kwargs: dict[str, Any] = {

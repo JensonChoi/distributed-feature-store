@@ -8,10 +8,11 @@ import pytest
 from sqlalchemy.orm import Session
 
 from feature_store.config import Settings
-from feature_store.db import JobRecord, StreamEventRecord
+from feature_store.db import JobRecord, MaterializationState, StreamEventRecord
 from feature_store.jobs import JobExecutor, JobService, LeaseLostError, serialize_job
 from feature_store.ledger import StreamEventLedger
 from feature_store.models import (
+    IncrementalMaterializationRequest,
     JobKind,
     JobRequest,
     JobStatus,
@@ -236,6 +237,20 @@ class CapturingOnlineStore:
         return True
 
 
+class ReplaySafeOnlineStore:
+    def __init__(self) -> None:
+        self.values: dict[str, tuple[datetime, str, float]] = {}
+
+    def upsert(self, event: StreamFeatureEvent) -> bool:
+        entity = str(event.entity_values["account_id"])
+        candidate = (event.event_timestamp, event.event_id)
+        existing = self.values.get(entity)
+        if existing is not None and (existing[0], existing[1]) >= candidate:
+            return False
+        self.values[entity] = (event.event_timestamp, event.event_id, event.values["amount"])
+        return True
+
+
 def test_materialization_uses_larger_event_id_at_equal_timestamp(
     tmp_path: Path, session: Session, manifest: RegistryManifest
 ) -> None:
@@ -260,6 +275,175 @@ def test_materialization_uses_larger_event_id_at_equal_timestamp(
 
     assert job.status == JobStatus.SUCCEEDED, job.error
     assert [(event.event_id, event.values["amount"]) for event in online.events] == [("b", 2.0)]
+    assert job.result_metadata == {
+        "mode": "explicit",
+        "effective_start": (timestamp - timedelta(seconds=1)).isoformat(),
+        "effective_end": (timestamp + timedelta(seconds=1)).isoformat(),
+        "lookback_seconds": 0,
+        "scanned_rows": 2,
+        "candidate_entities": 1,
+        "updated_entities": 1,
+        "skipped_entities": 0,
+        "source_freshness_at": timestamp.isoformat(),
+        "freshness_lag_seconds": 1.0,
+        "resulting_watermark": None,
+    }
+
+
+def test_incremental_materialization_bootstraps_then_uses_watermark_and_lookback(
+    tmp_path: Path, session: Session, manifest: RegistryManifest
+) -> None:
+    offline = LocalOfflineStore(tmp_path)
+    Registry(session).apply(manifest)
+    target = offline.view_uri("account_stats@1.0.0")
+    first_cutoff = datetime(2025, 1, 2, tzinfo=UTC)
+    rows = pa.Table.from_pylist(
+        [
+            {
+                "account_id": "old",
+                "event_timestamp": first_cutoff - timedelta(days=30),
+                "event_id": "old-1",
+                "amount": 1.0,
+                "event_date": "2024-12-03",
+            },
+            {
+                "account_id": "a",
+                "event_timestamp": first_cutoff - timedelta(minutes=10),
+                "event_id": "a-1",
+                "amount": 2.0,
+                "event_date": "2025-01-01",
+            },
+            {
+                "account_id": "excluded",
+                "event_timestamp": first_cutoff,
+                "event_id": "excluded-1",
+                "amount": 3.0,
+                "event_date": "2025-01-02",
+            },
+        ]
+    )
+    offline.append(target, rows, partition_by="event_date")
+    service = JobService(session)
+    first = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(
+            feature_view="account_stats@1.0.0", end=first_cutoff, lookback_seconds=3600
+        )
+    )
+    assert (
+        service.create_incremental_materialization(
+            IncrementalMaterializationRequest(feature_view="account_stats@1.0.0")
+        ).id
+        == first.id
+    )
+    online = ReplaySafeOnlineStore()
+    executor = JobExecutor(session, offline=offline, online=online)  # type: ignore[arg-type]
+    executor.execute(claim(executor, first.id))
+
+    state = session.get(MaterializationState, "account_stats@1.0.0")
+    assert state is not None
+    assert state.watermark == first_cutoff.replace(tzinfo=None)
+    assert state.active_job_id is None
+    assert state.last_successful_job_id == first.id
+    assert first.result_metadata is not None
+    assert first.result_metadata["effective_start"] is None
+    assert first.result_metadata["scanned_rows"] == 2
+    assert set(online.values) == {"old", "a"}
+
+    second_cutoff = first_cutoff + timedelta(hours=1)
+    late_rows = pa.Table.from_pylist(
+        [
+            {
+                "account_id": "late_inside",
+                "event_timestamp": first_cutoff - timedelta(minutes=30),
+                "event_id": "inside-1",
+                "amount": 4.0,
+                "event_date": "2025-01-01",
+            },
+            {
+                "account_id": "late_outside",
+                "event_timestamp": first_cutoff - timedelta(hours=2),
+                "event_id": "outside-1",
+                "amount": 5.0,
+                "event_date": "2025-01-01",
+            },
+        ],
+        schema=rows.schema,
+    )
+    offline.append(target, late_rows)
+    second = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(
+            feature_view="account_stats@1.0.0", end=second_cutoff, lookback_seconds=3600
+        )
+    )
+    executor.execute(claim(executor, second.id))
+    assert second.result_metadata is not None
+    assert second.result_metadata["effective_start"] == (
+        first_cutoff - timedelta(hours=1)
+    ).isoformat()
+    assert second.result_metadata["scanned_rows"] == 3
+    assert second.result_metadata["candidate_entities"] == 3
+    assert second.result_metadata["updated_entities"] == 2
+    assert second.result_metadata["skipped_entities"] == 1
+    assert "late_inside" in online.values
+    assert "late_outside" not in online.values
+
+    empty_cutoff = second_cutoff + timedelta(days=1)
+    empty = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(
+            feature_view="account_stats@1.0.0", end=empty_cutoff, lookback_seconds=0
+        )
+    )
+    executor.execute(claim(executor, empty.id))
+    assert empty.result_metadata is not None
+    assert empty.result_metadata["scanned_rows"] == 0
+    assert empty.result_metadata["candidate_entities"] == 0
+    assert empty.result_metadata["updated_entities"] == 0
+    assert empty.result_metadata["source_freshness_at"] == first_cutoff.isoformat()
+
+
+def test_incremental_versions_have_independent_reservations(
+    session: Session, manifest: RegistryManifest
+) -> None:
+    changed = manifest.model_copy(deep=True)
+    version_two = changed.feature_views[0].model_copy(update={"version": "2.0.0"})
+    changed.feature_views.append(version_two)
+    Registry(session).apply(changed)
+    service = JobService(session)
+    first = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(feature_view="account_stats@1.0.0")
+    )
+    second = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(feature_view="account_stats@2.0.0")
+    )
+    assert first.id != second.id
+    first_state = session.get(MaterializationState, "account_stats@1.0.0")
+    second_state = session.get(MaterializationState, "account_stats@2.0.0")
+    assert first_state is not None and first_state.active_job_id == first.id
+    assert second_state is not None and second_state.active_job_id == second.id
+
+
+def test_incremental_terminal_failure_releases_reservation_and_retry_reacquires(
+    session: Session, manifest: RegistryManifest
+) -> None:
+    Registry(session).apply(manifest)
+    service = JobService(session)
+    job = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(feature_view="account_stats@1.0.0")
+    )
+    executor = JobExecutor(session, offline=FailingOfflineStore(ValueError("bad table")))
+    executor.execute(claim(executor, job.id))
+    state = session.get(MaterializationState, "account_stats@1.0.0")
+    assert job.status == JobStatus.FAILED
+    assert state is not None and state.active_job_id is None and state.watermark is None
+
+    other = service.create_incremental_materialization(
+        IncrementalMaterializationRequest(feature_view="account_stats@1.0.0")
+    )
+    with pytest.raises(ValueError, match="another incremental materialization is active"):
+        service.retry(job.id)
+    service.cancel(other.id)
+    assert service.retry(job.id).status == JobStatus.PENDING
+    assert state.active_job_id == job.id
 
 
 def test_workers_claim_distinct_jobs_and_not_an_unexpired_job(session: Session) -> None:
@@ -358,6 +542,11 @@ class FailingOfflineStore(OfflineStore):
         self.error = error
 
     def load(self, uri: str, *, version: int | None = None) -> pa.Table:
+        raise self.error
+
+    def load_range(
+        self, uri: str, timestamp_field: str, start: datetime | None, end: datetime
+    ) -> pa.Table:
         raise self.error
 
 

@@ -215,6 +215,19 @@ class JobRequest(StrictModel):
         return self
 
 
+class IncrementalMaterializationRequest(StrictModel):
+    feature_view: str
+    end: datetime | None = None
+    lookback_seconds: int | None = Field(default=None, ge=0)
+
+    @field_validator("end")
+    @classmethod
+    def timezone_required(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("end must include a timezone")
+        return value
+
+
 class StreamFeatureEvent(StrictModel):
     event_id: str = Field(min_length=1, max_length=256)
     feature_view: str
@@ -286,6 +299,20 @@ class HistoricalResult(StrictModel):
     cleaned_up: bool = False
 
 
+class MaterializationSummary(StrictModel):
+    mode: Literal["explicit", "incremental"]
+    effective_start: datetime | None
+    effective_end: datetime
+    lookback_seconds: int
+    scanned_rows: int
+    candidate_entities: int
+    updated_entities: int
+    skipped_entities: int
+    source_freshness_at: datetime | None
+    freshness_lag_seconds: float | None
+    resulting_watermark: datetime | None
+
+
 class JobResponse(StrictModel):
     id: str
     kind: JobKind
@@ -305,7 +332,7 @@ class JobResponse(StrictModel):
     finished_at: datetime | None
     artifact_expires_at: datetime | None = None
     artifacts_cleaned_at: datetime | None = None
-    result: HistoricalResult | None = None
+    result: HistoricalResult | MaterializationSummary | None = None
 
 
 JsonObject = dict[str, Any]

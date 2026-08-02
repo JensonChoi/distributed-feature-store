@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +26,7 @@ class Settings(BaseSettings):
     job_max_attempts: int = 3
     job_retry_base_seconds: int = 5
     job_retry_max_seconds: int = 60
+    materialization_lookback_seconds: int = Field(default=3600, ge=0)
     stream_batch_size: int = 500
     stream_flush_seconds: float = 2.0
     log_level: str = "INFO"

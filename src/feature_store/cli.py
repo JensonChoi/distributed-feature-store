@@ -63,6 +63,22 @@ def materialize(feature_view: str, start: datetime, end: datetime) -> None:
         _print(client.materialize(feature_view, start, end))
 
 
+@app.command("materialize-incremental")
+def materialize_incremental(
+    feature_view: str,
+    end: Annotated[str | None, typer.Option(help="UTC ISO-8601 cutoff")] = None,
+    lookback_seconds: Annotated[int | None, typer.Option(min=0)] = None,
+) -> None:
+    with FeatureStoreClient() as client:
+        _print(
+            client.materialize_incremental(
+                feature_view,
+                end=datetime.fromisoformat(end) if end else None,
+                lookback_seconds=lookback_seconds,
+            )
+        )
+
+
 @app.command()
 def jobs() -> None:
     with FeatureStoreClient() as client:
