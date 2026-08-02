@@ -146,8 +146,8 @@ The built-in benchmark suite targets the checked-in fraud example. Prepare it be
 ```bash
 uv run feature-store demo
 # Wait until the backfill job reports "succeeded", then populate Redis for all four accounts:
-uv run feature-store materialize account_transaction_features@1.0.0 \
-  2025-01-01T00:00:00Z 2025-01-04T00:00:00Z
+uv run feature-store materialize-incremental account_transaction_features@1.0.0 \
+  --end 2025-01-04T00:00:00Z
 # Wait until the materialization job reports "succeeded", then run the suite:
 uv run feature-store-benchmark
 ```
@@ -167,6 +167,22 @@ Six scenarios exercise distinct payload and concurrency shapes:
 | `historical-small` | 100 observations | 1 | 1 |
 | `historical-wide` | 1,000 observations | 4 | 1 |
 | `historical-concurrent` | 250 observations | 4 | 4 |
+
+### Benchmark snapshot
+
+This snapshot was recorded on 2026-08-02 using a MacBook Air 9,1 with a 1.1 GHz quad-core
+Intel Core i5 and 16 GB RAM, running macOS 15.7.7 and Docker Compose v5.3.1. One default suite
+used three client-cold samples and a 10-second warm phase per scenario. All measured requests
+succeeded.
+
+| Scenario | Cold p50 (ms) | Warm succeeded/attempted | Warm requests/s | Warm entities or rows/s | Warm p50 (ms) | Warm p95 (ms) | Warm p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `online-small` | 63.745 | 143/143 | 14.279 | 14.279 | 54.923 | 152.475 | 228.528 |
+| `online-batch` | 75.261 | 89/89 | 8.837 | 35.347 | 86.912 | 293.181 | 334.580 |
+| `online-concurrent` | 91.827 | 52/52 | 4.818 | 19.270 | 1,575.589 | 2,317.115 | 2,485.617 |
+| `historical-small` | 809.548 | 12/12 | 1.108 | 110.764 | 812.389 | 1,988.768 | 1,988.768 |
+| `historical-wide` | 1,126.398 | 14/14 | 1.354 | 1,353.956 | 693.827 | 1,320.508 | 1,320.508 |
+| `historical-concurrent` | 260.472 | 33/33 | 3.049 | 762.345 | 1,224.183 | 1,705.353 | 1,720.126 |
 
 Each scenario takes three client-cold samples, then runs warm for 10 seconds by default. Cold
 means a new HTTP client and connection for every request. It does **not** flush Redis, restart a
