@@ -7,12 +7,12 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import pyarrow as pa
 from confluent_kafka import Consumer, KafkaError, Message, Producer
-from prometheus_client import Counter
+from prometheus_client import start_http_server
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
@@ -21,13 +21,17 @@ from feature_store.db import SessionLocal, StreamEventRecord, init_db
 from feature_store.jobs import JobService
 from feature_store.ledger import RegistrationResult, StreamEventLedger
 from feature_store.models import StreamEventState, StreamFeatureEvent, validate_feature_value
-from feature_store.observability import configure_logging
+from feature_store.observability import (
+    METRICS,
+    Metrics,
+    configure_logging,
+    update_operational_gauges,
+)
 from feature_store.offline import OfflineStore
 from feature_store.online import OnlineStore
 from feature_store.registry import Registry
 
 logger = logging.getLogger(__name__)
-CONSUMED = Counter("feature_store_stream_events_total", "Stream events", ["result"])
 
 
 @dataclass
@@ -45,6 +49,7 @@ class StreamConsumer:
         offline: OfflineStore | None = None,
         online: OnlineStore | None = None,
         session_factory: Callable[[], Session] = SessionLocal,
+        metrics: Metrics = METRICS,
     ):
         self.consumer = consumer
         self.producer = producer
@@ -52,6 +57,7 @@ class StreamConsumer:
         self.online = online or OnlineStore()
         self.session_factory = session_factory
         self.settings = get_settings()
+        self.metrics = metrics
         self.buffers: dict[str, dict[str, BufferedEvent]] = defaultdict(dict)
         self.last_flush = time.monotonic()
 
@@ -79,10 +85,15 @@ class StreamConsumer:
             self.consumer.close()
 
     def _handle(self, message: Message) -> None:
+        started = time.perf_counter()
+        outcome = "processing_failure"
         error = message.error()
         if error:
             if error.code() != KafkaError._PARTITION_EOF:
                 logger.error("consumer error: %s", error)
+            self.metrics.stream_processing_duration.labels("consumer_error").observe(
+                time.perf_counter() - started
+            )
             return
         try:
             raw_value = message.value()
@@ -92,6 +103,12 @@ class StreamConsumer:
             event = StreamFeatureEvent.model_validate(payload)
             if event.event_timestamp.tzinfo is None:
                 raise ValueError("event_timestamp must include a timezone")
+            ingestion_lag = (
+                datetime.now(UTC) - event.event_timestamp.astimezone(UTC)
+            ).total_seconds()
+            self.metrics.stream_ingestion_lag.labels(event.feature_view).observe(
+                max(0.0, ingestion_lag)
+            )
             with self.session_factory() as session:
                 registry = Registry(session)
                 view = registry.feature_view(event.feature_view)
@@ -125,28 +142,46 @@ class StreamConsumer:
                 )
                 self.flush()
                 self.consumer.commit(message=message, asynchronous=False)
-                CONSUMED.labels("dead_lettered").inc()
+                self.metrics.stream_events.labels("dead_lettered").inc()
+                self.metrics.stream_dead_letters.labels("identity_conflict").inc()
+                outcome = "dead_lettered"
                 return
             if registration.record.state != StreamEventState.PENDING:
                 self.flush()
                 self.consumer.commit(message=message, asynchronous=False)
-                CONSUMED.labels("duplicate").inc()
+                self.metrics.stream_events.labels("duplicate").inc()
+                outcome = "duplicate"
                 return
 
             durable_event = StreamEventLedger.event(registration.record)
             if self._buffer(registration.record.id, durable_event, message):
-                self.online.upsert(durable_event)
+                self._write_online(durable_event)
             result = (
                 "accepted"
                 if registration.result == RegistrationResult.NEW
                 else "duplicate_pending"
             )
-            CONSUMED.labels(result).inc()
+            self.metrics.stream_events.labels(result).inc()
+            outcome = result
         except (ValueError, ValidationError, json.JSONDecodeError) as exc:
             self._dead_letter(message, str(exc))
             self.flush()
             self.consumer.commit(message=message, asynchronous=False)
-            CONSUMED.labels("dead_lettered").inc()
+            self.metrics.stream_events.labels("dead_lettered").inc()
+            self.metrics.stream_dead_letters.labels("validation").inc()
+            outcome = "dead_lettered"
+        except Exception as exc:
+            logger.exception("stream message processing failed")
+            self._dead_letter(message, str(exc))
+            self.flush()
+            self.consumer.commit(message=message, asynchronous=False)
+            self.metrics.stream_events.labels("dead_lettered").inc()
+            self.metrics.stream_dead_letters.labels("processing_failure").inc()
+            outcome = "dead_lettered"
+        finally:
+            self.metrics.stream_processing_duration.labels(outcome).observe(
+                time.perf_counter() - started
+            )
 
     def recover_pending(self) -> int:
         with self.session_factory() as session:
@@ -154,10 +189,20 @@ class StreamConsumer:
             for record in records:
                 event = StreamEventLedger.event(record)
                 if self._buffer(record.id, event):
-                    self.online.upsert(event)
+                    self._write_online(event)
         if records:
             self.flush()
         return len(records)
+
+    def _write_online(self, event: StreamFeatureEvent) -> bool:
+        try:
+            accepted = self.online.upsert(event)
+        except Exception:
+            self.metrics.stream_online_writes.labels(event.feature_view, "error").inc()
+            raise
+        outcome = "accepted" if accepted else "skipped"
+        self.metrics.stream_online_writes.labels(event.feature_view, outcome).inc()
+        return accepted
 
     def _buffer(
         self, record_id: str, event: StreamFeatureEvent, message: Message | None = None
@@ -198,14 +243,25 @@ class StreamConsumer:
         )
 
     def flush(self) -> None:
-        staged_messages: list[Message] = []
-        for view_ref, buffer in list(self.buffers.items()):
-            if not buffer:
-                continue
-            staged_messages.extend(self._flush_view(view_ref, list(buffer.values())))
-            self.buffers[view_ref] = {}
-        self._commit_latest(staged_messages)
-        self.last_flush = time.monotonic()
+        started = time.perf_counter()
+        try:
+            staged_messages: list[Message] = []
+            for view_ref, buffer in list(self.buffers.items()):
+                if not buffer:
+                    continue
+                staged_messages.extend(self._flush_view(view_ref, list(buffer.values())))
+                self.buffers[view_ref] = {}
+            self._commit_latest(staged_messages)
+            self.last_flush = time.monotonic()
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "success"
+        finally:
+            self.metrics.stream_flush_duration.labels(outcome).observe(
+                time.perf_counter() - started
+            )
 
     def _flush_view(self, view_ref: str, buffer: list[BufferedEvent]) -> list[Message]:
         with self.session_factory() as session:
@@ -245,6 +301,9 @@ class StreamConsumer:
             session.commit()
 
         logger.info("staged %d events for %s", len(buffer), view_ref)
+        self.metrics.stream_staged_events.labels(view_ref).inc(len(buffer))
+        with self.session_factory() as metrics_session:
+            update_operational_gauges(metrics_session, self.metrics)
         return [message for item in buffer for message in item.messages]
 
     def _commit_latest(self, messages: list[Message]) -> None:
@@ -268,6 +327,7 @@ def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     init_db()
+    start_http_server(settings.stream_metrics_port, addr=settings.metrics_host)
     consumer = Consumer(
         {
             "bootstrap.servers": settings.kafka_bootstrap_servers,

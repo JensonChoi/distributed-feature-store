@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import traceback
 import uuid
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from feature_store.models import (
     StreamFeatureEvent,
     ValueType,
 )
+from feature_store.observability import METRICS, Metrics
 from feature_store.offline import OfflineStore, normalize_uri
 from feature_store.online import OnlineStore
 from feature_store.pit import HistoricalRetriever
@@ -368,6 +370,7 @@ class JobExecutor:
         worker_id: str | None = None,
         settings: Settings | None = None,
         now: Callable[[], datetime] | None = None,
+        metrics: Metrics = METRICS,
     ):
         self.session = session
         self.settings = settings or get_settings()
@@ -377,6 +380,7 @@ class JobExecutor:
         self.offline = offline or OfflineStore()
         self.online = online or OnlineStore()
         self.artifacts = artifacts or ArtifactStorage(self.settings)
+        self.metrics = metrics
 
     def claim_next(
         self, worker_id: str | None = None, *, now: datetime | None = None
@@ -496,6 +500,7 @@ class JobExecutor:
             if job is None:
                 return None
             self.session.refresh(job)
+            self.metrics.job_claimed.labels(job.kind).inc()
             return job
 
     def heartbeat(self, job_id: str, lease_token: str, *, now: datetime | None = None) -> bool:
@@ -522,6 +527,15 @@ class JobExecutor:
         return bool(result.rowcount)
 
     def execute(self, job: JobRecord) -> None:
+        started = time.perf_counter()
+        self._execute(job)
+        with suppress(Exception):
+            self.session.refresh(job)
+        outcome = "lease_lost" if job.status == JobStatus.RUNNING else str(job.status)
+        self.metrics.job_completed.labels(job.kind, outcome).inc()
+        self.metrics.job_duration.labels(job.kind, outcome).observe(time.perf_counter() - started)
+
+    def _execute(self, job: JobRecord) -> None:
         if not job.lease_token or not self._owns(job.id, job.lease_token):
             with suppress(Exception):
                 self.session.refresh(job)
@@ -759,8 +773,8 @@ class JobExecutor:
         query = HistoricalQuery.model_validate(payload)
         resolved = list(job.payload["resolved_features"])
         self._require_ownership(job, lease_token)
-        table = HistoricalRetriever(self.registry, self.offline).query_table(
-            query.observations, resolved_features=resolved
+        table = HistoricalRetriever(self.registry, self.offline, self.metrics).query_table(
+            query.observations, resolved_features=resolved, mode="async"
         )
         self._require_ownership(job, lease_token)
         uri = self.artifacts.result_uri(job.id, job.attempt_count, lease_token)

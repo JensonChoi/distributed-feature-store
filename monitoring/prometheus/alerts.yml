@@ -1,0 +1,34 @@
+groups:
+  - name: feature-store-local-examples
+    rules:
+      - alert: FeatureViewMaterializationStale
+        expr: feature_store_materialization_source_freshness_age_seconds > 3600
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: Feature view source freshness is over one hour old}
+      - alert: OnlineMissingRateHigh
+        expr: >-
+          sum(rate(feature_store_online_entity_results_total{result="missing"}[10m]))
+          / clamp_min(sum(rate(feature_store_online_entity_results_total[10m])), 0.001) > 0.05
+        for: 15m
+        labels: {severity: warning}
+        annotations: {summary: Online missing-result rate is above five percent}
+      - alert: FeatureStoreJobsStuck
+        expr: feature_store_job_queue_oldest_age_seconds{status=~"pending|retrying|running"} > 900
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: An active job has been waiting for over fifteen minutes}
+      - alert: StreamStagingBacklogOld
+        expr: feature_store_stream_ledger_oldest_record_age_seconds{state=~"pending|staged"} > 600
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: Stream staging backlog contains old records}
+      - alert: StreamDeadLettersDetected
+        expr: increase(feature_store_stream_dead_letters_total[10m]) > 0
+        labels: {severity: warning}
+        annotations: {summary: The stream consumer produced dead letters}
+      - alert: FeatureStoreTargetUnavailable
+        expr: up{job=~"feature-store-api|feature-store-worker|feature-store-stream"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: A feature store metrics target is unavailable}

@@ -7,10 +7,12 @@ import threading
 import time
 import uuid
 
+from prometheus_client import start_http_server
+
 from feature_store.config import get_settings
 from feature_store.db import SessionLocal, init_db
 from feature_store.jobs import JobExecutor
-from feature_store.observability import configure_logging
+from feature_store.observability import configure_logging, update_operational_gauges
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +43,13 @@ def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     init_db()
+    start_http_server(settings.worker_metrics_port, addr=settings.metrics_host)
     worker_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
     logger.info("worker started", extra={"worker_id": worker_id})
     last_cleanup = 0.0
     while True:
         with SessionLocal() as session:
+            update_operational_gauges(session)
             executor = JobExecutor(session, worker_id=worker_id, settings=settings)
             current = time.monotonic()
             if current - last_cleanup >= settings.artifact_cleanup_interval_seconds:
@@ -68,6 +72,7 @@ def run() -> None:
                         "max_attempts": job.max_attempts,
                     },
                 )
+                update_operational_gauges(session)
                 assert job.lease_token is not None
                 stopped = threading.Event()
                 heartbeat = threading.Thread(
@@ -90,6 +95,7 @@ def run() -> None:
                         "attempt_count": job.attempt_count,
                     },
                 )
+                update_operational_gauges(session)
             else:
                 time.sleep(settings.job_poll_seconds)
 

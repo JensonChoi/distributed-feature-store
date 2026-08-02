@@ -12,7 +12,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -31,16 +31,11 @@ from feature_store.models import (
     QueryResponse,
     RegistryManifest,
 )
-from feature_store.observability import configure_logging
+from feature_store.observability import METRICS, configure_logging
 from feature_store.offline import OfflineStore
 from feature_store.online import OnlineStore
 from feature_store.pit import HistoricalRetriever
 from feature_store.registry import Registry, RegistryConflictError, RegistryNotFoundError
-
-REQUESTS = Counter(
-    "feature_store_http_requests_total", "HTTP requests", ["method", "path", "status"]
-)
-LATENCY = Histogram("feature_store_http_request_seconds", "HTTP request duration", ["path"])
 
 
 def get_session() -> Any:
@@ -74,8 +69,8 @@ async def observe_requests(request: Request, call_next: Any) -> Response:
     response = await call_next(request)
     route = request.scope.get("route")
     path = getattr(route, "path", request.url.path)
-    REQUESTS.labels(request.method, path, response.status_code).inc()
-    LATENCY.labels(path).observe(time.perf_counter() - started)
+    METRICS.http_requests.labels(request.method, path, response.status_code).inc()
+    METRICS.http_duration.labels(path).observe(time.perf_counter() - started)
     response.headers["x-request-id"] = request_id
     return cast(Response, response)
 
