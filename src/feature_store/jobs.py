@@ -15,14 +15,16 @@ from deltalake.exceptions import SchemaMismatchError
 from pydantic import ValidationError
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from feature_store.artifacts import ArtifactStorage
 from feature_store.config import Settings, get_settings
-from feature_store.db import JobRecord, StreamEventRecord
+from feature_store.db import JobRecord, MaterializationState, StreamEventRecord
 from feature_store.models import (
     Feature,
     HistoricalQuery,
+    IncrementalMaterializationRequest,
     JobFailureKind,
     JobKind,
     JobRequest,
@@ -47,13 +49,14 @@ def _as_utc(value: datetime) -> datetime:
 
 def serialize_job(job: JobRecord) -> dict[str, Any]:
     result = None
-    if job.result_metadata and job.artifact_expires_at:
-        result = {
-            **job.result_metadata,
-            "download_url": f"/v1/jobs/{job.id}/result",
-            "expires_at": job.artifact_expires_at,
-            "cleaned_up": job.artifacts_cleaned_at is not None,
-        }
+    if job.result_metadata:
+        result = dict(job.result_metadata)
+        if job.kind == JobKind.HISTORICAL_QUERY and job.artifact_expires_at:
+            result.update(
+                download_url=f"/v1/jobs/{job.id}/result",
+                expires_at=job.artifact_expires_at,
+                cleaned_up=job.artifacts_cleaned_at is not None,
+            )
     return {
         "id": job.id,
         "kind": job.kind,
@@ -146,6 +149,71 @@ class JobService:
             raise
         return job
 
+    def create_incremental_materialization(
+        self,
+        request: IncrementalMaterializationRequest,
+        *,
+        now: datetime | None = None,
+    ) -> JobRecord:
+        submitted_at = _as_utc(now or datetime.now(UTC))
+        cutoff = _as_utc(request.end or submitted_at)
+        lookback = (
+            request.lookback_seconds
+            if request.lookback_seconds is not None
+            else self.settings.materialization_lookback_seconds
+        )
+        for attempt in range(2):
+            state = self.session.scalar(
+                select(MaterializationState)
+                .where(MaterializationState.feature_view == request.feature_view)
+                .with_for_update()
+            )
+            if state is not None and state.active_job_id:
+                active = self.session.get(JobRecord, state.active_job_id)
+                if active is not None and active.status in (
+                    JobStatus.PENDING,
+                    JobStatus.RETRYING,
+                    JobStatus.RUNNING,
+                ):
+                    self.session.commit()
+                    return active
+                state.active_job_id = None
+            if state is not None and state.watermark and cutoff < _as_utc(state.watermark):
+                self.session.rollback()
+                raise ValueError("end cannot precede the successful materialization watermark")
+            if state is None:
+                state = MaterializationState(
+                    feature_view=request.feature_view,
+                    updated_at=submitted_at,
+                )
+                self.session.add(state)
+            job = JobRecord(
+                id=str(uuid.uuid4()),
+                kind=JobKind.MATERIALIZE,
+                status=JobStatus.PENDING,
+                payload={
+                    "mode": "incremental",
+                    "feature_view": request.feature_view,
+                    "end": cutoff.isoformat(),
+                    "lookback_seconds": lookback,
+                },
+                checkpoints=[],
+                max_attempts=self.settings.job_max_attempts,
+            )
+            self.session.add(job)
+            state.active_job_id = job.id
+            state.updated_at = submitted_at
+            try:
+                self.session.commit()
+            except IntegrityError:
+                self.session.rollback()
+                if attempt == 0:
+                    continue
+                raise
+            self.session.refresh(job)
+            return job
+        raise RuntimeError("could not reserve incremental materialization")
+
     def get(self, job_id: str) -> JobRecord:
         job = self.session.get(JobRecord, job_id)
         if not job:
@@ -192,6 +260,7 @@ class JobService:
             self.session.rollback()
             self.session.refresh(job)
             raise ValueError("only pending, retrying, or running jobs can be cancelled")
+        self._release_incremental_reservation(job, now)
         self.session.commit()
         self.session.refresh(job)
         return job
@@ -199,10 +268,10 @@ class JobService:
     def retry(self, job_id: str) -> JobRecord:
         job = self.get(job_id)
         retryable_statuses = (JobStatus.FAILED, JobStatus.EXHAUSTED)
-        retryable_cancelled_query = (
-            job.status == JobStatus.CANCELLED and job.kind == JobKind.HISTORICAL_QUERY
+        retryable_cancelled = job.status == JobStatus.CANCELLED and (
+            job.kind == JobKind.HISTORICAL_QUERY or self._is_incremental(job)
         )
-        if job.status not in retryable_statuses and not retryable_cancelled_query:
+        if job.status not in retryable_statuses and not retryable_cancelled:
             raise ValueError("only failed or exhausted jobs can be retried")
         now = datetime.now(UTC)
         expires_at = job.artifact_expires_at
@@ -210,6 +279,29 @@ class JobService:
             expires_at is not None and _as_utc(expires_at) <= now
         ):
             raise ValueError("job artifacts have expired and the job cannot be retried")
+        if self._is_incremental(job):
+            state = self.session.scalar(
+                select(MaterializationState)
+                .where(MaterializationState.feature_view == job.payload["feature_view"])
+                .with_for_update()
+            )
+            if state is None:
+                state = MaterializationState(feature_view=job.payload["feature_view"])
+                self.session.add(state)
+                self.session.flush()
+            if state.active_job_id not in (None, job.id):
+                active = self.session.get(JobRecord, state.active_job_id)
+                if active is not None and active.status in (
+                    JobStatus.PENDING,
+                    JobStatus.RETRYING,
+                    JobStatus.RUNNING,
+                ):
+                    self.session.rollback()
+                    raise ValueError(
+                        f"another incremental materialization is active: {state.active_job_id}"
+                    )
+            state.active_job_id = job.id
+            state.updated_at = now
         result = cast(
             CursorResult[Any],
             self.session.execute(
@@ -248,6 +340,21 @@ class JobService:
         self.session.commit()
         self.session.refresh(job)
         return job
+
+    @staticmethod
+    def _is_incremental(job: JobRecord) -> bool:
+        return job.kind == JobKind.MATERIALIZE and job.payload.get("mode") == "incremental"
+
+    def _release_incremental_reservation(self, job: JobRecord, now: datetime) -> None:
+        if self._is_incremental(job):
+            self.session.execute(
+                update(MaterializationState)
+                .where(
+                    MaterializationState.feature_view == job.payload["feature_view"],
+                    MaterializationState.active_job_id == job.id,
+                )
+                .values(active_job_id=None, updated_at=now)
+            )
 
 
 class JobExecutor:
@@ -344,6 +451,10 @@ class JobExecutor:
                         )
                     ),
                 )
+                if result.rowcount and JobService._is_incremental(candidate):
+                    JobService(self.session, self.settings)._release_incremental_reservation(
+                        candidate, claimed_at
+                    )
                 self.session.commit()
                 if result.rowcount:
                     self.session.expire_all()
@@ -423,7 +534,7 @@ class JobExecutor:
             if job.kind == JobKind.BACKFILL:
                 self._backfill(job, lease_token)
             elif job.kind == JobKind.MATERIALIZE:
-                self._materialize(job, lease_token)
+                result_metadata = self._materialize(job, lease_token)
             elif job.kind == JobKind.OFFLINE_APPEND:
                 cleanup_uri = self._offline_append(job, lease_token)
             elif job.kind == JobKind.HISTORICAL_QUERY:
@@ -542,6 +653,34 @@ class JobExecutor:
         if not result.rowcount:
             self.session.rollback()
             raise LeaseLostError(f"job lease was lost before success: {job.id}")
+        if JobService._is_incremental(job):
+            source_freshness = None
+            if result_metadata and result_metadata.get("source_freshness_at"):
+                source_freshness = datetime.fromisoformat(
+                    str(result_metadata["source_freshness_at"])
+                )
+            state_result = cast(
+                CursorResult[Any],
+                self.session.execute(
+                    update(MaterializationState)
+                    .where(
+                        MaterializationState.feature_view == job.payload["feature_view"],
+                        MaterializationState.active_job_id == job.id,
+                    )
+                    .values(
+                        watermark=datetime.fromisoformat(job.payload["end"]),
+                        source_freshness_at=source_freshness,
+                        active_job_id=None,
+                        last_successful_job_id=job.id,
+                        updated_at=now,
+                    )
+                ),
+            )
+            if not state_result.rowcount:
+                self.session.rollback()
+                raise LeaseLostError(
+                    f"incremental materialization reservation was lost: {job.id}"
+                )
         if job.kind == JobKind.OFFLINE_APPEND:
             self._mark_stream_events_applied(job)
         self.session.commit()
@@ -606,6 +745,8 @@ class JobExecutor:
             with suppress(Exception):
                 self.session.refresh(job)
             return
+        if status in (JobStatus.FAILED, JobStatus.EXHAUSTED):
+            JobService(self.session, self.settings)._release_incremental_reservation(job, now)
         self.session.commit()
         self.session.refresh(job)
 
@@ -738,11 +879,18 @@ class JobExecutor:
                 self._commit_checkpoints(job, lease_token, [*job.checkpoints, checkpoint])
             cursor = chunk_end
 
-    def _materialize(self, job: JobRecord, lease_token: str) -> None:
+    def _materialize(self, job: JobRecord, lease_token: str) -> dict[str, Any]:
         view = self.registry.feature_view(job.payload["feature_view"])
         entity = self.registry.entity(view.entity)
-        start = datetime.fromisoformat(job.payload["start"]).astimezone(UTC)
+        mode = str(job.payload.get("mode", "explicit"))
         end = datetime.fromisoformat(job.payload["end"]).astimezone(UTC)
+        lookback_seconds = int(job.payload.get("lookback_seconds", 0))
+        state = self.session.get(MaterializationState, view.ref)
+        watermark = _as_utc(state.watermark) if state and state.watermark else None
+        if mode == "incremental":
+            start = watermark - timedelta(seconds=lookback_seconds) if watermark else None
+        else:
+            start = datetime.fromisoformat(job.payload["start"]).astimezone(UTC)
         self._require_ownership(job, lease_token)
         table = self.offline.load_range(
             self.offline.view_uri(view.ref), "event_timestamp", start, end
@@ -756,19 +904,54 @@ class JobExecutor:
             f"(PARTITION BY {partition} ORDER BY event_timestamp DESC, event_id DESC) = 1"
         ).to_arrow_table()
         connection.close()
+        scanned_freshness = max(
+            (_as_utc(value) for value in table["event_timestamp"].to_pylist()), default=None
+        )
+        prior_freshness = (
+            _as_utc(state.source_freshness_at)
+            if mode == "incremental" and state and state.source_freshness_at
+            else None
+        )
+        source_freshness = max(
+            (value for value in (prior_freshness, scanned_freshness) if value is not None),
+            default=None,
+        )
         feature_names = [feature.name for feature in view.features]
+        updated = 0
         for row in latest.to_pylist():
             self._require_ownership(job, lease_token)
-            self.online.upsert(
-                StreamFeatureEvent(
-                    event_id=row["event_id"],
-                    feature_view=view.ref,
-                    entity_values={key: row[key] for key in entity.join_keys},
-                    event_timestamp=row["event_timestamp"],
-                    values={name: row[name] for name in feature_names},
+            updated += int(
+                self.online.upsert(
+                    StreamFeatureEvent(
+                        event_id=row["event_id"],
+                        feature_view=view.ref,
+                        entity_values={key: row[key] for key in entity.join_keys},
+                        event_timestamp=row["event_timestamp"],
+                        values={name: row[name] for name in feature_names},
+                    )
                 )
             )
         self._commit_checkpoints(job, lease_token, [f"materialized:{latest.num_rows}"])
+        resulting_watermark = end if mode == "incremental" else watermark
+        return {
+            "mode": mode,
+            "effective_start": start.isoformat() if start else None,
+            "effective_end": end.isoformat(),
+            "lookback_seconds": lookback_seconds,
+            "scanned_rows": table.num_rows,
+            "candidate_entities": latest.num_rows,
+            "updated_entities": updated,
+            "skipped_entities": latest.num_rows - updated,
+            "source_freshness_at": source_freshness.isoformat() if source_freshness else None,
+            "freshness_lag_seconds": (
+                max(0.0, (end - source_freshness).total_seconds())
+                if source_freshness
+                else None
+            ),
+            "resulting_watermark": (
+                resulting_watermark.isoformat() if resulting_watermark else None
+            ),
+        }
 
     def _offline_append(self, job: JobRecord, lease_token: str) -> str:
         self._require_ownership(job, lease_token)

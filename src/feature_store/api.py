@@ -23,6 +23,7 @@ from feature_store.jobs import JobService, serialize_job
 from feature_store.models import (
     ApplyResult,
     HistoricalQuery,
+    IncrementalMaterializationRequest,
     JobKind,
     JobRequest,
     JobResponse,
@@ -164,6 +165,17 @@ def create_materialization(
 ) -> dict[str, Any]:
     Registry(session).feature_view(request.feature_view)
     return serialize_job(JobService(session).create(JobKind.MATERIALIZE, request))
+
+
+@app.post("/v1/jobs/materializations:incremental", status_code=202)
+def create_incremental_materialization(
+    request: IncrementalMaterializationRequest,
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    view = Registry(session).feature_view(request.feature_view)
+    if request.feature_view != view.ref:
+        raise ValueError("feature_view must pin an exact version")
+    return serialize_job(JobService(session).create_incremental_materialization(request))
 
 
 @app.get("/v1/jobs")

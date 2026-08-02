@@ -11,6 +11,7 @@ the registry and durable jobs.
 - Point-in-time correct historical joins with TTL handling and deterministic ties.
 - Inline and durable historical retrieval with streamed Parquet results.
 - Leased, resumable jobs with heartbeats, fenced completion, and bounded retries.
+- Watermark-driven incremental materialization with late-arrival lookback and coalescing.
 - Idempotent, out-of-order-safe online updates and durable offline stream ingestion.
 - One typed contract across the Python SDK, CLI, and REST API.
 
@@ -76,6 +77,28 @@ reported as `missing`. Feature values in either case are null.
 
 All timestamps at system boundaries must include a timezone and are normalized to UTC. Backfill
 ranges are start-inclusive and end-exclusive.
+
+## Incremental materialization
+
+An external scheduler can refresh a pinned feature view without calculating a start range:
+
+```bash
+uv run feature-store materialize-incremental account_transaction_features@1.0.0
+```
+
+The first successful run scans all offline history before its fixed submission-time cutoff.
+Later runs scan from the last successful watermark minus the configured lookback through the
+new cutoff. `FS_MATERIALIZATION_LOOKBACK_SECONDS` defaults to `3600`; use
+`--lookback-seconds` for a per-run override and `--end` for a fixed UTC cutoff. Overlapping
+submissions for the same pinned version coalesce onto one active job. For example, cron can
+invoke the command every five minutes:
+
+```cron
+*/5 * * * * cd /srv/feature-store && uv run feature-store materialize-incremental account_transaction_features@1.0.0
+```
+
+The service does not run an internal recurring scheduler. Explicit range materialization
+remains available through `feature-store materialize FEATURE_VIEW START END`.
 
 ## Development
 

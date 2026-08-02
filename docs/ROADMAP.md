@@ -47,19 +47,16 @@ Inputs and results expire together after the configured retention period. Worker
 complete job prefix during periodic, idempotent cleanup sweeps while retaining job metadata.
 Failed, exhausted, and cancelled inputs remain retryable until they expire.
 
-## Near term: reliability and measurable behavior
-
 ### Incremental materialization
 
-Track a high-water mark per feature view and materialize only changed offline partitions. Add a
-scheduled materialization command so online data can be refreshed without manually choosing
-every time range.
+Pinned feature-view versions now keep independent successful cutoff watermarks and source
+freshness. External schedulers can submit a cutoff-only command; overlapping submissions
+coalesce, first runs bootstrap all history, and later runs push a watermark/lookback range into
+Delta. Lease-fenced completion advances state, while replay-safe Redis writes produce typed
+updated, skipped, scan, entity, and freshness summaries. Persisted recurring schedules remain
+part of the later scheduled-jobs work.
 
-Completion signals:
-
-- Repeated schedules do not rewrite unchanged entities.
-- Late-arriving rows are included according to an explicit lookback policy.
-- Materialization reports scanned rows, updated entities, skipped entities, and freshness.
+## Near term: reliability and measurable behavior
 
 ### Feature freshness and serving metrics
 

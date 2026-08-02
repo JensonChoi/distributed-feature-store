@@ -37,3 +37,33 @@ def test_registry_api_is_idempotent_and_returns_request_id(
     finally:
         client.close()
         app.dependency_overrides.clear()
+
+
+def test_incremental_materialization_api_coalesces_active_submissions(
+    session: Session, manifest: RegistryManifest
+) -> None:
+    def override_session() -> Iterator[Session]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        client.post("/v1/registry/apply", json=manifest.model_dump(mode="json"))
+        payload = {
+            "feature_view": "account_stats@1.0.0",
+            "end": "2025-01-02T00:00:00Z",
+            "lookback_seconds": 120,
+        }
+        first = client.post("/v1/jobs/materializations:incremental", json=payload)
+        second = client.post("/v1/jobs/materializations:incremental", json=payload)
+        assert first.status_code == second.status_code == 202
+        assert first.json()["id"] == second.json()["id"]
+        assert first.json()["payload"] == {
+            "mode": "incremental",
+            "feature_view": "account_stats@1.0.0",
+            "end": "2025-01-02T00:00:00+00:00",
+            "lookback_seconds": 120,
+        }
+    finally:
+        client.close()
+        app.dependency_overrides.clear()

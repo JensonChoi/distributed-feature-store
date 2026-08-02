@@ -118,3 +118,36 @@ def test_historical_artifact_migration_preserves_jobs_and_downgrades_sqlite(
     assert "attempt_count" in columns
     engine.dispose()
     get_settings.cache_clear()
+
+
+def test_incremental_materialization_migration_upgrades_and_downgrades_sqlite(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    database_path = tmp_path / "incremental-materialization.db"
+    database_url = f"sqlite:///{database_path}"
+    monkeypatch.setenv("FS_DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = Config("alembic.ini")
+    command.upgrade(config, "0004")
+    engine = make_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO jobs (id, kind, status, payload, checkpoints, created_at, "
+                "attempt_count, max_attempts) VALUES "
+                "('existing', 'materialize', 'succeeded', '{}', '[]', "
+                "'2025-01-01 00:00:00', 1, 3)"
+            )
+        )
+
+    command.upgrade(config, "0005")
+    assert "materialization_states" in inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT id FROM jobs WHERE id='existing'")).scalar() == (
+            "existing"
+        )
+    command.downgrade(config, "0004")
+    assert "materialization_states" not in inspect(engine).get_table_names()
+    assert "jobs" in inspect(engine).get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()

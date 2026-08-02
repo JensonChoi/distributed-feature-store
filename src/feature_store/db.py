@@ -94,6 +94,21 @@ class StreamEventRecord(Base):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MaterializationState(Base):
+    __tablename__ = "materialization_states"
+
+    feature_view: Mapped[str] = mapped_column(String(160), primary_key=True)
+    watermark: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source_freshness_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    active_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    last_successful_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
 def make_engine(database_url: str | None = None):  # type: ignore[no-untyped-def]
     url = database_url or get_settings().database_url
     kwargs: dict[str, Any] = {"pool_pre_ping": True}

@@ -64,6 +64,8 @@ Postgres stores three kinds of state:
 - Durable backfill, materialization, offline-append, and historical-query jobs, including status,
   checkpoints, and private artifact references.
 - A durable stream-event ledger keyed by feature view and event ID.
+- Incremental materialization state per exact feature-view version, including the successful
+  cutoff watermark, source freshness, active reservation, and last successful job.
 
 Feature views have semantic identities such as `account_transaction_features@1.0.0`. Applying
 different content under an existing identity causes a conflict, while reapplying identical
@@ -170,10 +172,18 @@ and [`jobs.py`](../src/feature_store/jobs.py).
 
 ## Materialization
 
-A materialization job bridges the offline and online stores. The worker reads a requested time
-range from a feature view's Delta table, selects the latest row for each entity using event time
-and event ID ordering, and upserts those rows into Redis through the same replay-safe online
-store interface used by streaming.
+A materialization job bridges the offline and online stores. Explicit jobs read their requested
+range. Incremental jobs reserve one active job per pinned feature-view version and use a fixed
+cutoff: the first run scans all history, while later runs push a
+`[watermark - lookback, cutoff)` predicate into the Delta read. The worker selects the latest
+row for each entity using event time and event ID ordering and upserts through the same
+replay-safe online-store interface used by streaming. Successful writes and rejected older or
+equal values are reported separately.
+
+Only the lease-fenced success transaction advances the watermark and publishes source
+freshness. Automatic retries retain the reservation; cancellation or terminal exhaustion
+releases it, and manual retry must reacquire it. External cron or another scheduler submits
+incremental jobs—the service intentionally does not persist or execute recurring schedules.
 
 ## Local deployment
 

@@ -11,6 +11,7 @@ from feature_store.config import get_settings
 from feature_store.models import (
     ApplyResult,
     HistoricalQuery,
+    IncrementalMaterializationRequest,
     JobRequest,
     JobResponse,
     Observation,
@@ -106,6 +107,25 @@ class FeatureStoreClient:
 
     def materialize(self, feature_view: str, start: datetime, end: datetime) -> dict[str, Any]:
         return self._create_job("materializations", feature_view, start, end)
+
+    def materialize_incremental(
+        self,
+        feature_view: str,
+        *,
+        end: datetime | None = None,
+        lookback_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        request = IncrementalMaterializationRequest(
+            feature_view=feature_view,
+            end=end,
+            lookback_seconds=lookback_seconds,
+        )
+        response = self._client.post(
+            "/v1/jobs/materializations:incremental",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+        response.raise_for_status()
+        return cast(dict[str, Any], response.json())
 
     def job(self, job_id: str) -> dict[str, Any]:
         response = self._client.get(f"/v1/jobs/{job_id}")
