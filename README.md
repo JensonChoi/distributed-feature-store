@@ -133,40 +133,87 @@ configured and these rules send no notifications.
 uv run ruff check .
 uv run mypy src
 uv run pytest
-uv run feature-store-benchmark --iterations 200
+uv run feature-store-benchmark --list-scenarios
 ```
 
 The Docker integration test profile requires a Docker daemon. Core correctness tests use local
 SQLite and Delta tables and do not require infrastructure.
 
-## Benchmark results
+## Representative load testing
 
-This snapshot was recorded on 2026-07-27 using a MacBook Air 9,1 with a 1.1 GHz quad-core
-Intel Core i5 and 16 GB RAM, running macOS 15.7.7 and Docker Compose v5.3.1. Five sequential
-runs each measured 200 online requests and one 1,000-row historical query.
-
-| Run | Online p50 (ms) | Online p95 (ms) | Historical (s) | Historical (rows/s) |
-| ---: | ---: | ---: | ---: | ---: |
-| 1 | 19.442 | 32.913 | 0.332 | 3,013.8 |
-| 2 | 18.047 | 33.977 | 0.299 | 3,347.1 |
-| 3 | 18.784 | 23.589 | 0.282 | 3,548.4 |
-| 4 | 19.315 | 37.299 | 0.356 | 2,809.4 |
-| 5 | 19.637 | 37.673 | 0.273 | 3,656.7 |
-
-| Metric | Median | Min–max range |
-| --- | ---: | ---: |
-| Online p50 (ms) | 19.315 | 18.047–19.637 |
-| Online p95 (ms) | 33.977 | 23.589–37.673 |
-| Historical (s) | 0.299 | 0.273–0.356 |
-| Historical (rows/s) | 3,347.1 | 2,809.4–3,656.7 |
-
-Run the same benchmark with:
+The built-in benchmark suite targets the checked-in fraud example. Prepare it before running:
 
 ```bash
+uv run feature-store demo
+# Wait until the backfill job reports "succeeded", then populate Redis for all four accounts:
+uv run feature-store materialize-incremental account_transaction_features@1.0.0 \
+  --end 2025-01-04T00:00:00Z
+# Wait until the materialization job reports "succeeded", then run the suite:
+uv run feature-store-benchmark
+```
+
+Keep `FS_INLINE_QUERY_LIMIT` at least `1000`. The suite expects the seeded 72-hour fraud
+dataset, its four accounts, the four pinned `account_transaction_features@1.0.0` features, a
+completed backfill, and materialized online values. Readiness and argument failures stop the run
+immediately.
+
+Six scenarios exercise distinct payload and concurrency shapes:
+
+| Scenario | Request shape | Features | Concurrency |
+| --- | ---: | ---: | ---: |
+| `online-small` | 1 entity | 1 | 1 |
+| `online-batch` | 4 entities | 4 | 1 |
+| `online-concurrent` | 4 entities | 4 | 8 |
+| `historical-small` | 100 observations | 1 | 1 |
+| `historical-wide` | 1,000 observations | 4 | 1 |
+| `historical-concurrent` | 250 observations | 4 | 4 |
+
+### Benchmark snapshot
+
+This snapshot was recorded on 2026-08-02 using a MacBook Air 9,1 with a 1.1 GHz quad-core
+Intel Core i5 and 16 GB RAM, running macOS 15.7.7 and Docker Compose v5.3.1. One default suite
+used three client-cold samples and a 10-second warm phase per scenario. All measured requests
+succeeded.
+
+| Scenario | Cold p50 (ms) | Warm succeeded/attempted | Warm requests/s | Warm entities or rows/s | Warm p50 (ms) | Warm p95 (ms) | Warm p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `online-small` | 63.745 | 143/143 | 14.279 | 14.279 | 54.923 | 152.475 | 228.528 |
+| `online-batch` | 75.261 | 89/89 | 8.837 | 35.347 | 86.912 | 293.181 | 334.580 |
+| `online-concurrent` | 91.827 | 52/52 | 4.818 | 19.270 | 1,575.589 | 2,317.115 | 2,485.617 |
+| `historical-small` | 809.548 | 12/12 | 1.108 | 110.764 | 812.389 | 1,988.768 | 1,988.768 |
+| `historical-wide` | 1,126.398 | 14/14 | 1.354 | 1,353.956 | 693.827 | 1,320.508 | 1,320.508 |
+| `historical-concurrent` | 260.472 | 33/33 | 3.049 | 762.345 | 1,224.183 | 1,705.353 | 1,720.126 |
+
+Each scenario takes three client-cold samples, then runs warm for 10 seconds by default. Cold
+means a new HTTP client and connection for every request. It does **not** flush Redis, restart a
+service, clear a server-side cache, or change stored data. Every warm worker owns one persistent
+async client, primes it once outside the measurements, and sends requests until the shared
+deadline.
+
+Use repeatable `--scenario` options to run a subset. `--iterations` remains available as an
+optional cap on measured warm requests per scenario; it is useful for bounded tests and does
+not replace the duration deadline. Other controls are `--duration-seconds`,
+`--cold-iterations`, `--list-scenarios`, and `--output`:
+
+```bash
+uv run feature-store-benchmark --list-scenarios
+uv run feature-store-benchmark --scenario online-concurrent \
+  --scenario historical-concurrent --duration-seconds 20 --output benchmark.json
 uv run feature-store-benchmark --iterations 200
 ```
 
-These results are a machine-dependent snapshot, not enforced performance thresholds.
+Versioned JSON is always printed to stdout and is also written to `--output` when supplied. It
+contains run and platform metadata, dataset assumptions, each scenario's explicit shape, and
+separate cold/warm measurements. Measurements report attempted, succeeded, and failed request
+counts; bounded error categories; error rate; elapsed time; successful requests per second;
+successful entities or rows per second; and nearest-rank p50, p95, and p99 latency. HTTP 200 is
+the only success. In particular, a historical HTTP 202 is an unexpected response because the
+suite measures inline retrieval.
+
+Individual request failures are recorded without aborting the report. The command exits nonzero
+after writing the report only when a selected warm scenario has no successful requests; it does
+not enforce latency, throughput, or error-rate thresholds. Results are informational and vary
+with the machine, container resources, and competing load.
 
 ## Deliberate boundaries
 

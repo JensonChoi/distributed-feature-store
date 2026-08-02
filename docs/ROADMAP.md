@@ -65,19 +65,14 @@ the stream consumer reports processing, staging, online writes, ingestion lag, a
 dead letters. Compose includes a provisioned Grafana operator dashboard and local example alert
 rules. Labels are restricted to pinned registry references and bounded enumerations.
 
-## Near term: reliability and measurable behavior
-
 ### Representative load testing
 
-Expand the benchmark into explicit scenarios rather than a single sequential loop. Cover
-multiple entity counts, feature counts, concurrent clients, sustained load, and cold versus
-warm behavior.
-
-Completion signals:
-
-- Results include p50, p95, p99, throughput, and error rate.
-- Online and historical scenarios declare their dataset and payload shapes.
-- Benchmarks remain informational unless a separate, justified SLO is adopted.
+The fraud example now has six reproducible online and historical scenarios spanning small and
+wide payloads, concurrent clients, and sustained warm phases. Each worker primes and reuses its
+own HTTP client, while separate client-cold samples create a new connection per request without
+mutating backend state. Versioned JSON declares dataset and payload assumptions and reports
+nearest-rank p50/p95/p99 latency, successful request and entity-or-row throughput, error rates,
+and bounded failure categories. Results remain informational and machine-dependent.
 
 ## Next: developer and operator experience
 
