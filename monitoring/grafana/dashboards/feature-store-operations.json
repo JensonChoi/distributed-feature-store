@@ -1,0 +1,92 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries", "title": "Online request rate", "id": 1,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "targets": [{"expr": "sum by (operation, outcome) (rate(feature_store_online_requests_total[5m]))", "legendFormat": "{{operation}} {{outcome}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Online latency p95", "id": 2,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, operation) (rate(feature_store_online_request_duration_seconds_bucket[5m])))", "legendFormat": "{{operation}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Online missing ratio", "id": 3,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "targets": [{"expr": "sum by (feature_view) (rate(feature_store_online_entity_results_total{result=\"missing\"}[5m])) / clamp_min(sum by (feature_view) (rate(feature_store_online_entity_results_total[5m])), 0.001)", "legendFormat": "{{feature_view}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Historical latency p95", "id": 4,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, mode) (rate(feature_store_historical_query_duration_seconds_bucket[5m])))", "legendFormat": "{{mode}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Historical missing and expired ratio", "id": 5,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "targets": [{"expr": "sum by (feature_view, result) (rate(feature_store_historical_entity_results_total{result=~\"missing|expired\"}[5m])) / clamp_min(sum by (feature_view) (rate(feature_store_historical_entity_results_total[5m])), 0.001)", "legendFormat": "{{feature_view}} {{result}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Served freshness p95", "id": 6,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le, feature_view) (rate(feature_store_online_served_value_age_seconds_bucket[5m])))", "legendFormat": "online {{feature_view}}"},
+        {"expr": "histogram_quantile(0.95, sum by (le, feature_view) (rate(feature_store_historical_served_value_age_seconds_bucket[5m])))", "legendFormat": "historical {{feature_view}}"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Materialization freshness", "id": 7,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+      "targets": [
+        {"expr": "feature_store_materialization_watermark_age_seconds", "legendFormat": "watermark {{feature_view}}"},
+        {"expr": "feature_store_materialization_source_freshness_age_seconds", "legendFormat": "source {{feature_view}}"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Job queue depth and oldest age", "id": 8,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+      "targets": [
+        {"expr": "feature_store_job_queue_depth", "legendFormat": "depth {{status}}"},
+        {"expr": "feature_store_job_queue_oldest_age_seconds", "legendFormat": "age {{status}}"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Job attempts and duration p95", "id": 9,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+      "targets": [
+        {"expr": "sum by (kind, outcome) (rate(feature_store_job_attempts_completed_total[5m]))", "legendFormat": "rate {{kind}} {{outcome}}"},
+        {"expr": "histogram_quantile(0.95, sum by (le, kind) (rate(feature_store_job_execution_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{kind}}"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Stream ingestion lag p95", "id": 10,
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, feature_view) (rate(feature_store_stream_event_ingestion_lag_seconds_bucket[5m])))", "legendFormat": "{{feature_view}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Dead letters", "id": 11,
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "targets": [{"expr": "sum by (reason) (rate(feature_store_stream_dead_letters_total[5m]))", "legendFormat": "{{reason}}"}]
+    },
+    {
+      "type": "timeseries", "title": "Staging backlog", "id": 12,
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "targets": [
+        {"expr": "feature_store_stream_ledger_depth", "legendFormat": "depth {{state}}"},
+        {"expr": "feature_store_stream_ledger_oldest_record_age_seconds", "legendFormat": "age {{state}}"},
+        {"expr": "sum by (feature_view) (rate(feature_store_stream_staged_events_total[5m]))", "legendFormat": "staged {{feature_view}}"}
+      ]
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["feature-store", "operations"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "Feature Store Operations",
+  "uid": "feature-store-operations",
+  "version": 1
+}

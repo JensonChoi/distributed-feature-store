@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     materialization_lookback_seconds: int = Field(default=3600, ge=0)
     stream_batch_size: int = 500
     stream_flush_seconds: float = 2.0
+    metrics_host: str = "0.0.0.0"
+    worker_metrics_port: int = 9101
+    stream_metrics_port: int = 9102
     log_level: str = "INFO"
 
     @property

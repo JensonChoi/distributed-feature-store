@@ -30,7 +30,10 @@ uv run feature-store demo-stream
 ```
 
 The API documentation is available at <http://localhost:8000/docs>, MinIO at
-<http://localhost:9001>, and metrics at <http://localhost:8000/metrics>.
+<http://localhost:9001>, Prometheus at <http://localhost:9090>, and the provisioned Grafana
+dashboard at <http://localhost:3000> (local admin credentials: `admin`/`admin`). Metrics are
+served by the API at `:8000/metrics`, the worker at `:9101/metrics`, and the stream consumer at
+`:9102/metrics`.
 
 ## Data flow
 
@@ -99,6 +102,30 @@ invoke the command every five minutes:
 
 The service does not run an internal recurring scheduler. Explicit range materialization
 remains available through `feature-store materialize FEATURE_VIEW START END`.
+
+## Freshness and serving metrics
+
+Prometheus measures online reads/upserts, historical inline/async queries, jobs, materialization
+freshness, and stream processing. Served-age histograms use the persisted feature event time:
+online age is measured against wall-clock read time, while historical age is measured between
+the observation and selected point-in-time row. Materialization exports both watermark age and
+freshest-source-event age. Queue and ledger gauges include depth and oldest-record age.
+
+Labels are intentionally bounded: exact pinned `feature_view` references, job kind/status,
+operation, and fixed outcomes/reasons. Entity/event/job IDs, source paths, offsets, and exception
+text are never metric labels. Useful local queries include:
+
+```promql
+sum(rate(feature_store_online_entity_results_total{result="missing"}[5m]))
+  / sum(rate(feature_store_online_entity_results_total[5m]))
+histogram_quantile(0.95,
+  sum by (le, feature_view) (rate(feature_store_online_served_value_age_seconds_bucket[5m])))
+max by (status) (feature_store_job_queue_oldest_age_seconds)
+```
+
+The alert rules in `monitoring/prometheus/alerts.yml` are local examples only. Their thresholds
+must be tuned to production traffic, feature SLAs, and retry behavior. Alertmanager is not
+configured and these rules send no notifications.
 
 ## Development
 

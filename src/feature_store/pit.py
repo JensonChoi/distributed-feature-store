@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from datetime import UTC
 from typing import Any
@@ -8,6 +9,7 @@ import duckdb
 import pyarrow as pa
 
 from feature_store.models import Observation, QueryResponse
+from feature_store.observability import METRICS, Metrics
 from feature_store.offline import OfflineStore
 from feature_store.registry import Registry
 
@@ -17,9 +19,15 @@ def _ident(value: str) -> str:
 
 
 class HistoricalRetriever:
-    def __init__(self, registry: Registry, offline: OfflineStore | None = None):
+    def __init__(
+        self,
+        registry: Registry,
+        offline: OfflineStore | None = None,
+        metrics: Metrics = METRICS,
+    ):
         self.registry = registry
         self.offline = offline or OfflineStore()
+        self.metrics = metrics
 
     def query(
         self,
@@ -27,9 +35,23 @@ class HistoricalRetriever:
         features: list[str],
         feature_service: str | None = None,
     ) -> QueryResponse:
-        resolved = self.validate(observations, features, feature_service)
-        table = self.query_table(observations, resolved_features=resolved)
-        return QueryResponse(resolved_features=resolved, rows=table.to_pylist())
+        started = time.perf_counter()
+        self.metrics.historical_observations.labels("inline").inc(len(observations))
+        try:
+            resolved = self.validate(observations, features, feature_service)
+            table = self._query_table(observations, resolved_features=resolved)
+            response = QueryResponse(resolved_features=resolved, rows=table.to_pylist())
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "success"
+            return response
+        finally:
+            self.metrics.historical_queries.labels("inline", outcome).inc()
+            self.metrics.historical_duration.labels("inline", outcome).observe(
+                time.perf_counter() - started
+            )
 
     def validate(
         self,
@@ -51,6 +73,29 @@ class HistoricalRetriever:
         return resolved
 
     def query_table(
+        self,
+        observations: list[Observation],
+        *,
+        resolved_features: list[str],
+        mode: str = "inline",
+    ) -> pa.Table:
+        started = time.perf_counter()
+        self.metrics.historical_observations.labels(mode).inc(len(observations))
+        try:
+            result = self._query_table(observations, resolved_features=resolved_features)
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "success"
+            return result
+        finally:
+            self.metrics.historical_queries.labels(mode, outcome).inc()
+            self.metrics.historical_duration.labels(mode, outcome).observe(
+                time.perf_counter() - started
+            )
+
+    def _query_table(
         self, observations: list[Observation], *, resolved_features: list[str]
     ) -> pa.Table:
         resolved = resolved_features
@@ -82,14 +127,30 @@ class HistoricalRetriever:
             uri = self.offline.view_uri(view_ref)
             if not self.offline.exists(uri):
                 current = self._append_missing(current, view.name, feature_names)
+                self.metrics.historical_entity_results.labels(view_ref, "missing").inc(
+                    current.num_rows
+                )
                 continue
             feature_rows = self.offline.load(uri)
             if feature_rows.num_rows == 0:
                 current = self._append_missing(current, view.name, feature_names)
+                self.metrics.historical_entity_results.labels(view_ref, "missing").inc(
+                    current.num_rows
+                )
                 continue
             current = self._join_view(
                 current, feature_rows, view.name, feature_names, entity.join_keys, view.ttl_seconds
             )
+            status_column = current[f"{view.name}__status"]
+            for status in ("present", "missing", "expired"):
+                count = sum(value == status for value in status_column.to_pylist())
+                if count:
+                    self.metrics.historical_entity_results.labels(view_ref, status).inc(count)
+            age_column = f"__feature_store_age__{view.name}"
+            for age in current[age_column].to_pylist():
+                if age is not None:
+                    self.metrics.historical_served_age.labels(view_ref).observe(max(0.0, age))
+            current = current.drop([age_column])
 
         final = current.drop(["_row_id"])
         return final
@@ -122,8 +183,12 @@ class HistoricalRetriever:
             f"THEN f.{_ident(name)} ELSE NULL END AS {_ident(f'{view_name}__{name}')}"
             for name in feature_names
         )
+        age_column = _ident(f"__feature_store_age__{view_name}")
         query = f"""
-            SELECT o.*, {status} AS {_ident(f"{view_name}__status")}, {feature_columns}
+            SELECT o.*, {status} AS {_ident(f"{view_name}__status")}, {feature_columns},
+                   CASE WHEN f.event_timestamp IS NOT NULL AND NOT ({ttl_expired})
+                        THEN epoch(o.event_timestamp - f.event_timestamp)
+                        ELSE NULL END AS {age_column}
             FROM observations o
             LEFT JOIN feature_rows f
               ON {join} AND f.event_timestamp <= o.event_timestamp

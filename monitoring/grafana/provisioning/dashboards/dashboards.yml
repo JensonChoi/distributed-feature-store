@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: Feature Store
+    folder: Feature Store
+    type: file
+    disableDeletion: true
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

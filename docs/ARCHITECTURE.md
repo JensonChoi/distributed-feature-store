@@ -170,6 +170,25 @@ retained indefinitely in this first version. See
 [`ledger.py`](../src/feature_store/ledger.py), [`streaming.py`](../src/feature_store/streaming.py),
 and [`jobs.py`](../src/feature_store/jobs.py).
 
+## Observability
+
+Each process exposes Prometheus metrics: API `:8000/metrics`, worker `:9101/metrics`, and stream
+consumer `:9102/metrics`. `FS_METRICS_HOST`, `FS_WORKER_METRICS_PORT`, and
+`FS_STREAM_METRICS_PORT` configure the dedicated exporters. Metric definitions are centralized
+in `observability.py`; labels are limited to operator-controlled pinned feature-view references
+and bounded enums such as operation, status, outcome, and dead-letter reason.
+
+Online serving observes the wall-clock age of Redis values. Historical joins compute an
+internal age from observation time to the selected feature event, observe it, and remove the
+column before constructing any API or Parquet result. Database-backed gauges expose active job
+queues, incremental materialization watermark/source age, and pending/staged ledger backlog.
+The stream consumer categorizes dead letters as `validation`, `identity_conflict`, or
+`processing_failure`; exception text remains only in logs and DLQ headers.
+
+Compose provisions Prometheus scrape targets, local example alert rules, and a Grafana dashboard
+for serving, freshness, jobs, lag, dead letters, and staging. The thresholds are demonstrations,
+not production SLOs, and no Alertmanager is included.
+
 ## Materialization
 
 A materialization job bridges the offline and online stores. Explicit jobs read their requested
@@ -196,6 +215,7 @@ Docker Compose runs:
 - Redis.
 - MinIO and its bucket initializer.
 - Redpanda.
+- Prometheus and Grafana.
 
 The project therefore demonstrates distributed-system boundaries, durable handoffs, consistent
 batch and streaming representations, and separate online and offline retrieval paths. The

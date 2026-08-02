@@ -56,19 +56,16 @@ Delta. Lease-fenced completion advances state, while replay-safe Redis writes pr
 updated, skipped, scan, entity, and freshness summaries. Persisted recurring schedules remain
 part of the later scheduled-jobs work.
 
-## Near term: reliability and measurable behavior
-
 ### Feature freshness and serving metrics
 
-Extend Prometheus instrumentation beyond HTTP latency. Measure feature age, missing and expired
-rates, online-store latency, historical-query duration, job queue depth, job age, stream lag,
-dead-letter counts, and staging backlog.
+Prometheus instrumentation now covers online and historical serving latency, outcomes,
+missing/expired results, and the age of values actually served. Worker metrics expose job
+attempts, queue state, materialization watermark/source freshness, and stream-ledger backlog;
+the stream consumer reports processing, staging, online writes, ingestion lag, and categorized
+dead letters. Compose includes a provisioned Grafana operator dashboard and local example alert
+rules. Labels are restricted to pinned registry references and bounded enumerations.
 
-Completion signals:
-
-- Each data path has latency, throughput, error, and freshness signals.
-- Metric labels have bounded cardinality.
-- A local dashboard and example alerts identify stale features and stuck pipelines.
+## Near term: reliability and measurable behavior
 
 ### Representative load testing
 
