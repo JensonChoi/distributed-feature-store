@@ -6,26 +6,61 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
+from pydantic import ValidationError
 
 from feature_store.sdk import FeatureStoreClient
 
 app = typer.Typer(no_args_is_help=True, help="Operate the distributed feature store.")
+registry_app = typer.Typer(no_args_is_help=True, help="Validate and manage registry objects.")
+app.add_typer(registry_app, name="registry")
 
 
 def _print(value: object) -> None:
     typer.echo(json.dumps(value, indent=2, default=str))
 
 
+def _registry_file(operation: str, path: Path) -> None:
+    try:
+        with FeatureStoreClient() as client:
+            result = getattr(client, f"{operation}_file")(path)
+        _print(result.model_dump(mode="json"))
+        if operation in {"validate", "plan"} and result.summary.rejected:
+            raise typer.Exit(code=1)
+    except (OSError, ValidationError, yaml.YAMLError) as exc:
+        _print({"error": str(exc)})
+        raise typer.Exit(code=2) from exc
+
+
 @app.command("apply")
 def apply(path: Annotated[Path, typer.Argument(exists=True, readable=True)]) -> None:
-    with FeatureStoreClient() as client:
-        _print(client.apply_file(path).model_dump(mode="json"))
+    _registry_file("apply", path)
 
 
 @app.command("list")
 def list_objects(kind: Annotated[str | None, typer.Option()] = None) -> None:
     with FeatureStoreClient() as client:
         _print(client.list_registry(kind))
+
+
+@registry_app.command("validate")
+def registry_validate(path: Annotated[Path, typer.Argument(exists=True, readable=True)]) -> None:
+    _registry_file("validate", path)
+
+
+@registry_app.command("plan")
+def registry_plan(path: Annotated[Path, typer.Argument(exists=True, readable=True)]) -> None:
+    _registry_file("plan", path)
+
+
+@registry_app.command("apply")
+def registry_apply(path: Annotated[Path, typer.Argument(exists=True, readable=True)]) -> None:
+    _registry_file("apply", path)
+
+
+@registry_app.command("list")
+def registry_list(kind: Annotated[str | None, typer.Option()] = None) -> None:
+    list_objects(kind)
 
 
 @app.command("online-read")

@@ -15,7 +15,15 @@ from feature_store.models import (
     Entity,
     FeatureService,
     FeatureView,
+    RegistryDifference,
+    RegistryDiffOperation,
+    RegistryIssue,
     RegistryManifest,
+    RegistryObjectIdentity,
+    RegistryObjectPlan,
+    RegistryObjectStatus,
+    RegistryPlan,
+    RegistryPlanSummary,
     StreamSource,
 )
 
@@ -33,64 +41,231 @@ def _fingerprint(spec: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _json_pointer(path: str, part: str | int) -> str:
+    escaped = str(part).replace("~", "~0").replace("/", "~1")
+    return f"{path}/{escaped}"
+
+
+def _differences(existing: Any, proposed: Any, path: str = "") -> list[RegistryDifference]:
+    if isinstance(existing, dict) and isinstance(proposed, dict):
+        output: list[RegistryDifference] = []
+        for key in sorted(existing.keys() | proposed.keys()):
+            child_path = _json_pointer(path, key)
+            if key not in existing:
+                output.append(
+                    RegistryDifference(
+                        path=child_path,
+                        operation=RegistryDiffOperation.ADDED,
+                        proposed=proposed[key],
+                    )
+                )
+            elif key not in proposed:
+                output.append(
+                    RegistryDifference(
+                        path=child_path,
+                        operation=RegistryDiffOperation.REMOVED,
+                        existing=existing[key],
+                    )
+                )
+            else:
+                output.extend(_differences(existing[key], proposed[key], child_path))
+        return output
+    if isinstance(existing, list) and isinstance(proposed, list):
+        output = []
+        for index in range(max(len(existing), len(proposed))):
+            child_path = _json_pointer(path, index)
+            if index >= len(existing):
+                output.append(
+                    RegistryDifference(
+                        path=child_path,
+                        operation=RegistryDiffOperation.ADDED,
+                        proposed=proposed[index],
+                    )
+                )
+            elif index >= len(proposed):
+                output.append(
+                    RegistryDifference(
+                        path=child_path,
+                        operation=RegistryDiffOperation.REMOVED,
+                        existing=existing[index],
+                    )
+                )
+            else:
+                output.extend(_differences(existing[index], proposed[index], child_path))
+        return output
+    if existing != proposed:
+        return [
+            RegistryDifference(
+                path=path or "/",
+                operation=RegistryDiffOperation.CHANGED,
+                existing=existing,
+                proposed=proposed,
+            )
+        ]
+    return []
+
+
 class Registry:
     def __init__(self, session: Session):
         self.session = session
 
     def apply(self, manifest: RegistryManifest) -> ApplyResult:
-        self._validate_references(manifest)
-        created = 0
-        unchanged = 0
-        objects: list[tuple[str, str, str, dict[str, Any]]] = []
-        objects.extend(
-            ("entity", item.name, "", item.model_dump(mode="json")) for item in manifest.entities
-        )
-        objects.extend(
-            ("batch_source", item.name, "", item.model_dump(mode="json"))
-            for item in manifest.batch_sources
-        )
-        objects.extend(
-            ("stream_source", item.name, "", item.model_dump(mode="json"))
-            for item in manifest.stream_sources
-        )
-        objects.extend(
-            ("feature_view", item.name, item.version, item.model_dump(mode="json"))
-            for item in manifest.feature_views
-        )
-        objects.extend(
-            ("feature_service", item.name, "", item.model_dump(mode="json"))
-            for item in manifest.feature_services
-        )
-        for kind, name, version, spec in objects:
-            fingerprint = _fingerprint(spec)
-            existing = self.session.scalar(
-                select(RegistryRecord).where(
-                    RegistryRecord.kind == kind,
-                    RegistryRecord.name == name,
-                    RegistryRecord.version == version,
-                )
+        plan = self.plan(manifest)
+        rejected = [item for item in plan.objects if item.status == RegistryObjectStatus.REJECTED]
+        if rejected:
+            issue_owner, issue = next(
+                (
+                    (item, issue)
+                    for item in rejected
+                    for issue in item.issues
+                    if issue.code != "immutable_conflict"
+                ),
+                (rejected[0], rejected[0].issues[0]),
             )
-            if existing:
-                if existing.fingerprint != fingerprint:
-                    suffix = f"@{version}" if version else ""
-                    self.session.rollback()
-                    raise RegistryConflictError(
-                        f"immutable registry object changed: {name}{suffix}"
-                    )
-                unchanged += 1
+            if issue.code == "immutable_conflict":
+                identity = issue_owner.identity
+                suffix = f"@{identity.version}" if identity.version else ""
+                raise RegistryConflictError(
+                    f"immutable registry object changed: {identity.name}{suffix}"
+                )
+            raise RegistryNotFoundError(issue.message)
+        objects = self._manifest_objects(manifest)
+        for object_plan, (kind, name, version, spec) in zip(plan.objects, objects, strict=True):
+            if object_plan.status != RegistryObjectStatus.CREATED:
                 continue
             self.session.add(
                 RegistryRecord(
                     kind=kind,
                     name=name,
                     version=version,
-                    fingerprint=fingerprint,
+                    fingerprint=_fingerprint(spec),
                     spec=spec,
                 )
             )
-            created += 1
         self.session.commit()
-        return ApplyResult(fingerprint=manifest.fingerprint(), created=created, unchanged=unchanged)
+        return ApplyResult(
+            fingerprint=plan.fingerprint,
+            created=plan.summary.created,
+            unchanged=plan.summary.unchanged,
+        )
+
+    def validate(self, manifest: RegistryManifest) -> RegistryPlan:
+        return self.plan(manifest)
+
+    def plan(self, manifest: RegistryManifest) -> RegistryPlan:
+        with self.session.no_autoflush:
+            stored = {
+                (record.kind, record.name, record.version): record
+                for record in self.session.scalars(select(RegistryRecord))
+            }
+        available_entities = {name for kind, name, _ in stored if kind == "entity"}
+        available_batch_sources = {name for kind, name, _ in stored if kind == "batch_source"}
+        available_stream_sources = {name for kind, name, _ in stored if kind == "stream_source"}
+        available_views: dict[tuple[str, str], FeatureView] = {
+            (name, version): FeatureView.model_validate(record.spec)
+            for (kind, name, version), record in stored.items()
+            if kind == "feature_view"
+        }
+        plans: list[RegistryObjectPlan] = []
+        for kind, name, version, spec in self._manifest_objects(manifest):
+            identity = RegistryObjectIdentity(
+                kind=kind, name=name, version=version or None
+            )
+            existing = stored.get((kind, name, version))
+            differences: list[RegistryDifference] = []
+            issues: list[RegistryIssue] = []
+            if existing is not None and existing.fingerprint != _fingerprint(spec):
+                differences = _differences(existing.spec, spec)
+                suffix = f"@{version}" if version else ""
+                issues.append(
+                    RegistryIssue(
+                        code="immutable_conflict",
+                        path="/",
+                        message=f"immutable registry object changed: {name}{suffix}",
+                    )
+                )
+            if kind == "feature_view":
+                view = FeatureView.model_validate(spec)
+                if view.entity not in available_entities:
+                    issues.append(
+                        RegistryIssue(
+                            code="missing_entity",
+                            path="/entity",
+                            message=f"unknown entity: {view.entity}",
+                        )
+                    )
+                if view.batch_source not in available_batch_sources:
+                    issues.append(
+                        RegistryIssue(
+                            code="missing_batch_source",
+                            path="/batch_source",
+                            message=f"unknown batch source: {view.batch_source}",
+                        )
+                    )
+                if view.stream_source and view.stream_source not in available_stream_sources:
+                    issues.append(
+                        RegistryIssue(
+                            code="missing_stream_source",
+                            path="/stream_source",
+                            message=f"unknown stream source: {view.stream_source}",
+                        )
+                    )
+            if kind == "feature_service":
+                service = FeatureService.model_validate(spec)
+                for index, ref in enumerate(service.features):
+                    view_ref, feature_name = ref.rsplit(":", 1)
+                    view_name, view_version = parse_view_ref(view_ref)
+                    referenced_view = available_views.get((view_name, view_version))
+                    if referenced_view is None:
+                        issues.append(
+                            RegistryIssue(
+                                code="missing_feature_view",
+                                path=f"/features/{index}",
+                                message=f"unknown feature view: {view_ref}",
+                            )
+                        )
+                    elif feature_name not in {
+                        feature.name for feature in referenced_view.features
+                    }:
+                        issues.append(
+                            RegistryIssue(
+                                code="missing_feature",
+                                path=f"/features/{index}",
+                                message=f"unknown feature: {ref}",
+                            )
+                        )
+            if issues:
+                status = RegistryObjectStatus.REJECTED
+            elif existing is not None:
+                status = RegistryObjectStatus.UNCHANGED
+            else:
+                status = RegistryObjectStatus.CREATED
+            plans.append(
+                RegistryObjectPlan(
+                    identity=identity,
+                    status=status,
+                    issues=issues,
+                    differences=differences,
+                )
+            )
+            if status in {RegistryObjectStatus.CREATED, RegistryObjectStatus.UNCHANGED}:
+                if kind == "entity":
+                    available_entities.add(name)
+                elif kind == "batch_source":
+                    available_batch_sources.add(name)
+                elif kind == "stream_source":
+                    available_stream_sources.add(name)
+                elif kind == "feature_view":
+                    available_views[(name, version)] = FeatureView.model_validate(spec)
+        return RegistryPlan(
+            fingerprint=manifest.fingerprint(),
+            summary=RegistryPlanSummary(
+                created=sum(item.status == RegistryObjectStatus.CREATED for item in plans),
+                unchanged=sum(item.status == RegistryObjectStatus.UNCHANGED for item in plans),
+                rejected=sum(item.status == RegistryObjectStatus.REJECTED for item in plans),
+            ),
+            objects=plans,
+        )
 
     def list_records(self, kind: str | None = None) -> list[dict[str, Any]]:
         statement = select(RegistryRecord).order_by(
@@ -161,41 +336,31 @@ class Registry:
             raise RegistryNotFoundError(f"unknown {kind}: {name}{suffix}")
         return record
 
-    def _validate_references(self, manifest: RegistryManifest) -> None:
-        entities = {item.name for item in manifest.entities} | set(self._names("entity"))
-        batch_sources = {item.name for item in manifest.batch_sources} | set(
-            self._names("batch_source")
+    @staticmethod
+    def _manifest_objects(
+        manifest: RegistryManifest,
+    ) -> list[tuple[str, str, str, dict[str, Any]]]:
+        objects: list[tuple[str, str, str, dict[str, Any]]] = []
+        objects.extend(
+            ("entity", item.name, "", item.model_dump(mode="json")) for item in manifest.entities
         )
-        stream_sources = {item.name for item in manifest.stream_sources} | set(
-            self._names("stream_source")
+        objects.extend(
+            ("batch_source", item.name, "", item.model_dump(mode="json"))
+            for item in manifest.batch_sources
         )
-        views = {(item.name, item.version): item for item in manifest.feature_views}
-        for view in manifest.feature_views:
-            if view.entity not in entities:
-                raise RegistryNotFoundError(f"unknown entity: {view.entity}")
-            if view.batch_source not in batch_sources:
-                raise RegistryNotFoundError(f"unknown batch source: {view.batch_source}")
-            if view.stream_source and view.stream_source not in stream_sources:
-                raise RegistryNotFoundError(f"unknown stream source: {view.stream_source}")
-        for service in manifest.feature_services:
-            for ref in service.features:
-                view_ref, feature_name = ref.rsplit(":", 1)
-                name, version = parse_view_ref(view_ref)
-                manifest_view = views.get((name, version))
-                if manifest_view is None:
-                    try:
-                        manifest_view = self.feature_view(view_ref)
-                    except RegistryNotFoundError as exc:
-                        raise RegistryNotFoundError(f"unknown feature view: {view_ref}") from exc
-                if feature_name not in {item.name for item in manifest_view.features}:
-                    raise RegistryNotFoundError(f"unknown feature: {ref}")
-
-    def _names(self, kind: str) -> list[str]:
-        return list(
-            self.session.scalars(
-                select(RegistryRecord.name).where(RegistryRecord.kind == kind).distinct()
-            )
+        objects.extend(
+            ("stream_source", item.name, "", item.model_dump(mode="json"))
+            for item in manifest.stream_sources
         )
+        objects.extend(
+            ("feature_view", item.name, item.version, item.model_dump(mode="json"))
+            for item in manifest.feature_views
+        )
+        objects.extend(
+            ("feature_service", item.name, "", item.model_dump(mode="json"))
+            for item in manifest.feature_services
+        )
+        return objects
 
 
 def parse_view_ref(ref: str) -> tuple[str, str]:
