@@ -277,6 +277,73 @@ class ApplyResult(StrictModel):
     unchanged: int
 
 
+class RegistryObjectStatus(StrEnum):
+    CREATED = "created"
+    UNCHANGED = "unchanged"
+    REJECTED = "rejected"
+
+
+class RegistryObjectKind(StrEnum):
+    ENTITY = "entity"
+    BATCH_SOURCE = "batch_source"
+    STREAM_SOURCE = "stream_source"
+    FEATURE_VIEW = "feature_view"
+    FEATURE_SERVICE = "feature_service"
+
+
+class RegistryIssueCode(StrEnum):
+    IMMUTABLE_CONFLICT = "immutable_conflict"
+    MISSING_ENTITY = "missing_entity"
+    MISSING_BATCH_SOURCE = "missing_batch_source"
+    MISSING_STREAM_SOURCE = "missing_stream_source"
+    MISSING_FEATURE_VIEW = "missing_feature_view"
+    MISSING_FEATURE = "missing_feature"
+
+
+class RegistryDiffOperation(StrEnum):
+    ADDED = "added"
+    REMOVED = "removed"
+    CHANGED = "changed"
+
+
+class RegistryObjectIdentity(StrictModel):
+    kind: RegistryObjectKind
+    name: str
+    version: str | None = None
+
+
+class RegistryIssue(StrictModel):
+    code: RegistryIssueCode
+    path: str
+    message: str
+
+
+class RegistryDifference(StrictModel):
+    path: str
+    operation: RegistryDiffOperation
+    existing: Any = None
+    proposed: Any = None
+
+
+class RegistryObjectPlan(StrictModel):
+    identity: RegistryObjectIdentity
+    status: RegistryObjectStatus
+    issues: list[RegistryIssue] = []
+    differences: list[RegistryDifference] = []
+
+
+class RegistryPlanSummary(StrictModel):
+    created: int
+    unchanged: int
+    rejected: int
+
+
+class RegistryPlan(StrictModel):
+    fingerprint: str
+    summary: RegistryPlanSummary
+    objects: list[RegistryObjectPlan]
+
+
 class QueryStatus(StrEnum):
     PRESENT = "present"
     MISSING = "missing"

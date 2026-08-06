@@ -54,6 +54,31 @@ services must pin exact feature references such as
 `account_transaction_features@1.0.0:txn_count_1h`. Applying a changed definition under an
 existing identity returns a conflict.
 
+## Registry validation and planning
+
+Validate references against both the manifest and the objects already stored by the service,
+then inspect the same preflight result before applying it:
+
+```bash
+uv run feature-store registry validate examples/fraud/registry.yaml
+uv run feature-store registry plan examples/fraud/registry.yaml
+uv run feature-store registry apply examples/fraud/registry.yaml
+uv run feature-store registry list --kind feature_view
+```
+
+Validation and planning are server-aware, read-only operations. Their JSON output classifies
+each object as `created`, `unchanged`, or `rejected`, includes stable issue codes and JSON-style
+field paths, and shows recursive `added`, `removed`, and `changed` differences for immutable
+conflicts. Both commands exit nonzero when any object is rejected, making them suitable for CI.
+The legacy top-level `feature-store apply` and `feature-store list` commands remain available.
+
+The Python SDK exposes the same workflow through `validate_file`, `plan_file`, and `apply_file`
+(as well as methods accepting a typed `RegistryManifest`). The corresponding HTTP endpoints
+are `POST /v1/registry/validate`, `POST /v1/registry/plan`, and
+`POST /v1/registry/apply`. Validation failures return a structured HTTP 200 report; malformed
+request bodies still return HTTP 422. Apply reruns the preflight and commits all accepted
+objects atomically.
+
 Historical requests containing at most `FS_INLINE_QUERY_LIMIT` observations return rows inline.
 Larger requests return a `historical_query` job after their feature selectors and entity keys
 have been validated. Poll the job and download its Parquet result when it succeeds:

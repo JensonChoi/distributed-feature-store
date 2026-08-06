@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 
+from feature_store.models import RegistryManifest
 from feature_store.sdk import FeatureStoreClient
 
 
@@ -131,3 +132,36 @@ def test_sdk_incremental_materialization_contract() -> None:
             "lookback_seconds": 120,
         },
     }
+
+
+def test_sdk_registry_plan_methods_parse_typed_responses(
+    tmp_path: Path, manifest: RegistryManifest
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "fingerprint": manifest.fingerprint(),
+                "summary": {"created": 0, "unchanged": 0, "rejected": 0},
+                "objects": [],
+            },
+        )
+
+    path = tmp_path / "registry.yaml"
+    path.write_text("entities: []\n")
+    with FeatureStoreClient(
+        "http://feature-store", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert client.validate(manifest).summary.rejected == 0
+        assert client.validate_file(path).objects == []
+        assert client.plan(manifest).summary.created == 0
+        assert client.plan_file(path).objects == []
+    assert paths == [
+        "/v1/registry/validate",
+        "/v1/registry/validate",
+        "/v1/registry/plan",
+        "/v1/registry/plan",
+    ]

@@ -30,6 +30,7 @@ from feature_store.models import (
     OnlineQuery,
     QueryResponse,
     RegistryManifest,
+    RegistryPlan,
 )
 from feature_store.observability import METRICS, configure_logging
 from feature_store.offline import OfflineStore
@@ -115,6 +116,20 @@ def apply_registry(
     manifest: RegistryManifest, session: Session = Depends(get_session)
 ) -> ApplyResult:
     return Registry(session).apply(manifest)
+
+
+@app.post("/v1/registry/validate", response_model=RegistryPlan)
+def validate_registry(
+    manifest: RegistryManifest, session: Session = Depends(get_session)
+) -> RegistryPlan:
+    return Registry(session).validate(manifest)
+
+
+@app.post("/v1/registry/plan", response_model=RegistryPlan)
+def plan_registry(
+    manifest: RegistryManifest, session: Session = Depends(get_session)
+) -> RegistryPlan:
+    return Registry(session).plan(manifest)
 
 
 @app.get("/v1/registry")

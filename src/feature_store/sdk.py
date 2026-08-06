@@ -18,6 +18,7 @@ from feature_store.models import (
     OnlineQuery,
     QueryResponse,
     RegistryManifest,
+    RegistryPlan,
 )
 
 
@@ -50,8 +51,25 @@ class FeatureStoreClient:
         return ApplyResult.model_validate(response.json())
 
     def apply_file(self, path: str | Path) -> ApplyResult:
-        content = yaml.safe_load(Path(path).read_text())
-        return self.apply(RegistryManifest.model_validate(content))
+        return self.apply(self._manifest_file(path))
+
+    def validate(self, manifest: RegistryManifest) -> RegistryPlan:
+        response = self._client.post(
+            "/v1/registry/validate", json=manifest.model_dump(mode="json")
+        )
+        response.raise_for_status()
+        return RegistryPlan.model_validate(response.json())
+
+    def validate_file(self, path: str | Path) -> RegistryPlan:
+        return self.validate(self._manifest_file(path))
+
+    def plan(self, manifest: RegistryManifest) -> RegistryPlan:
+        response = self._client.post("/v1/registry/plan", json=manifest.model_dump(mode="json"))
+        response.raise_for_status()
+        return RegistryPlan.model_validate(response.json())
+
+    def plan_file(self, path: str | Path) -> RegistryPlan:
+        return self.plan(self._manifest_file(path))
 
     def list_registry(self, kind: str | None = None) -> list[dict[str, Any]]:
         response = self._client.get("/v1/registry", params={"kind": kind} if kind else None)
@@ -149,3 +167,8 @@ class FeatureStoreClient:
         response = self._client.post(f"/v1/jobs/{kind}", json=request.model_dump(mode="json"))
         response.raise_for_status()
         return cast(dict[str, Any], response.json())
+
+    @staticmethod
+    def _manifest_file(path: str | Path) -> RegistryManifest:
+        content = yaml.safe_load(Path(path).read_text())
+        return RegistryManifest.model_validate(content)

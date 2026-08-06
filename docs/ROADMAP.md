@@ -74,20 +74,16 @@ mutating backend state. Versioned JSON declares dataset and payload assumptions 
 nearest-rank p50/p95/p99 latency, successful request and entity-or-row throughput, error rates,
 and bounded failure categories. Results remain informational and machine-dependent.
 
-## Next: developer and operator experience
-
 ### Registry plan, diff, and validation
 
-Add a dry-run operation that shows which objects would be created, left unchanged, or rejected.
-Report reference errors and immutable-definition conflicts before applying any changes.
+Registry manifests can now be validated and planned against stored objects without writes.
+Reports deterministically classify proposed objects as created, unchanged, or rejected,
+aggregate missing-reference and immutable-conflict issues, and include recursive field-level
+diffs. The API and typed SDK expose the workflow, while nested registry CLI commands print JSON
+and return a failing exit status for rejected plans. Apply uses the same preflight before its
+atomic commit, and the original top-level apply and list commands remain compatibility aliases.
 
-Possible commands:
-
-```bash
-feature-store registry validate examples/fraud/registry.yaml
-feature-store registry plan examples/fraud/registry.yaml
-feature-store registry apply examples/fraud/registry.yaml
-```
+## Next: developer and operator experience
 
 ### Registry lifecycle metadata
 
