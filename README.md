@@ -79,6 +79,30 @@ are `POST /v1/registry/validate`, `POST /v1/registry/plan`, and
 request bodies still return HTTP 422. Apply reruns the preflight and commits all accepted
 objects atomically.
 
+## Registry lifecycle metadata
+
+Manage discovery and deprecation metadata separately from immutable registry definitions:
+
+```bash
+uv run feature-store registry describe feature_view account_transaction_features \
+  --version 1.0.0 --feature txn_count_1h
+uv run feature-store registry metadata feature_view account_transaction_features \
+  --version 1.0.0 --owner fraud-platform --tag tier=critical \
+  --documentation https://docs.example.com/features/transactions
+uv run feature-store registry deprecate feature_view account_transaction_features \
+  --version 1.0.0 --message "migrate to 2.0.0" \
+  --replacement account_transaction_features --replacement-version 2.0.0
+uv run feature-store registry activate feature_view account_transaction_features \
+  --version 1.0.0
+```
+
+Owners, tags, and documentation links are last-write-wins fields and can be reset with
+`--clear-owners`, `--clear-tags`, and `--clear-documentation`. Creation time and the original
+manifest fingerprint are derived provenance and cannot be edited. Deprecation is advisory:
+planning, apply, and serving responses include stable structured warnings, but deprecated
+objects and features remain readable. Historical jobs snapshot warnings at submission so job
+and result metadata stay reproducible if lifecycle state later changes.
+
 Historical requests containing at most `FS_INLINE_QUERY_LIMIT` observations return rows inline.
 Larger requests return a `historical_query` job after their feature selectors and entity keys
 have been validated. Poll the job and download its Parquet result when it succeeds:

@@ -94,8 +94,9 @@ class OnlineStore:
         feature_service: str | None,
     ) -> QueryResponse:
         resolved = registry.resolve_features(features, feature_service)
+        warnings = registry.warnings_for_query(features, feature_service)
         if not entities:
-            return QueryResponse(resolved_features=resolved, rows=[])
+            return QueryResponse(resolved_features=resolved, rows=[], warnings=warnings)
         grouped: dict[str, list[str]] = defaultdict(list)
         for ref in resolved:
             view_ref, feature_name = ref.rsplit(":", 1)
@@ -127,4 +128,4 @@ class OnlineStore:
                     raw = stored.get(name)
                     row[f"{view.name}__{name}"] = json.loads(raw) if raw is not None else None
             rows.append(row)
-        return QueryResponse(resolved_features=resolved, rows=rows)
+        return QueryResponse(resolved_features=resolved, rows=rows, warnings=warnings)

@@ -40,7 +40,11 @@ class HistoricalRetriever:
         try:
             resolved = self.validate(observations, features, feature_service)
             table = self._query_table(observations, resolved_features=resolved)
-            response = QueryResponse(resolved_features=resolved, rows=table.to_pylist())
+            response = QueryResponse(
+                resolved_features=resolved,
+                rows=table.to_pylist(),
+                warnings=self.registry.warnings_for_query(features, feature_service),
+            )
         except Exception:
             outcome = "error"
             raise

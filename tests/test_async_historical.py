@@ -15,7 +15,13 @@ from feature_store.artifacts import ArtifactStorage
 from feature_store.config import Settings, get_settings
 from feature_store.db import JobRecord
 from feature_store.jobs import JobExecutor, JobService, serialize_job
-from feature_store.models import HistoricalQuery, JobStatus, Observation, RegistryManifest
+from feature_store.models import (
+    HistoricalQuery,
+    JobStatus,
+    Observation,
+    RegistryManifest,
+    RegistryTarget,
+)
 from feature_store.offline import OfflineStore
 from feature_store.pit import HistoricalRetriever
 from feature_store.registry import Registry
@@ -67,9 +73,23 @@ def test_historical_job_writes_and_publishes_versioned_parquet(
     resolved = HistoricalRetriever(registry, offline).validate(
         request.observations, request.features, request.feature_service
     )
-    job = JobService(session).create_historical_query(request, resolved, artifacts)
+    feature_target = RegistryTarget(
+        kind="feature_view",
+        name="account_stats",
+        version="1.0.0",
+        feature="amount",
+    )
+    registry.deprecate(feature_target, "use a newer feature")
+    warning_snapshot = registry.warnings_for_query(request.features)
+    job = JobService(session).create_historical_query(
+        request, resolved, artifacts, warnings=warning_snapshot
+    )
+    registry.reactivate(feature_target)
     assert artifacts.exists(artifacts.input_uri(job.id))
     assert "artifact_uri" not in serialize_job(job)
+    assert job.payload["warnings"] == [
+        warning.model_dump(mode="json") for warning in warning_snapshot
+    ]
 
     settings = Settings(historical_result_ttl_seconds=60)
     executor = JobExecutor(session, offline=offline, artifacts=artifacts, settings=settings)
@@ -86,6 +106,7 @@ def test_historical_job_writes_and_publishes_versioned_parquet(
     assert result["account_stats__amount"].to_pylist() == [12.5, 12.5]
     response = serialize_job(claimed)
     assert response["result"]["row_count"] == 2
+    assert response["payload"]["warnings"] == response["result"]["warnings"]
     assert response["result"]["download_url"] == f"/v1/jobs/{job.id}/result"
     assert "result_uri" not in response
 
@@ -148,9 +169,7 @@ def test_async_api_validates_before_staging_and_streams_result(
         get_settings.cache_clear()
 
 
-def test_expired_artifacts_are_gone_and_cannot_be_retried(
-    tmp_path: Path, session: Session
-) -> None:
+def test_expired_artifacts_are_gone_and_cannot_be_retried(tmp_path: Path, session: Session) -> None:
     artifacts = ArtifactStorage(root_uri=str(tmp_path / "artifacts"))
     now = datetime(2025, 1, 2, tzinfo=UTC)
     job = JobRecord(
@@ -181,15 +200,11 @@ def test_expired_artifacts_are_gone_and_cannot_be_retried(
         raise AssertionError("expired historical jobs must not be retried")
 
 
-def test_cancelled_historical_job_can_retry_before_expiry(
-    tmp_path: Path, session: Session
-) -> None:
+def test_cancelled_historical_job_can_retry_before_expiry(tmp_path: Path, session: Session) -> None:
     artifacts = ArtifactStorage(root_uri=str(tmp_path / "artifacts"))
     timestamp = datetime.now(UTC)
     request = query(timestamp)
-    job = JobService(session).create_historical_query(
-        request, request.features, artifacts
-    )
+    job = JobService(session).create_historical_query(request, request.features, artifacts)
     service = JobService(session, Settings(historical_result_ttl_seconds=60))
     cancelled = service.cancel(job.id)
     assert cancelled.artifact_expires_at is not None

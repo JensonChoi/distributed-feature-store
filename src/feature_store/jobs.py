@@ -30,6 +30,7 @@ from feature_store.models import (
     JobKind,
     JobRequest,
     JobStatus,
+    RegistryWarning,
     StreamEventState,
     StreamFeatureEvent,
     ValueType,
@@ -124,6 +125,8 @@ class JobService:
         query: HistoricalQuery,
         resolved_features: list[str],
         artifacts: ArtifactStorage,
+        *,
+        warnings: list[RegistryWarning] | None = None,
     ) -> JobRecord:
         job_id = str(uuid.uuid4())
         artifact_uri = artifacts.input_uri(job_id)
@@ -135,6 +138,7 @@ class JobService:
             payload={
                 "observation_count": len(query.observations),
                 "resolved_features": resolved_features,
+                "warnings": [warning.model_dump(mode="json") for warning in (warnings or [])],
             },
             artifact_uri=artifact_uri,
             checkpoints=[],
@@ -692,9 +696,7 @@ class JobExecutor:
             )
             if not state_result.rowcount:
                 self.session.rollback()
-                raise LeaseLostError(
-                    f"incremental materialization reservation was lost: {job.id}"
-                )
+                raise LeaseLostError(f"incremental materialization reservation was lost: {job.id}")
         if job.kind == JobKind.OFFLINE_APPEND:
             self._mark_stream_events_applied(job)
         self.session.commit()
@@ -764,9 +766,7 @@ class JobExecutor:
         self.session.commit()
         self.session.refresh(job)
 
-    def _historical_query(
-        self, job: JobRecord, lease_token: str
-    ) -> tuple[str, dict[str, Any]]:
+    def _historical_query(self, job: JobRecord, lease_token: str) -> tuple[str, dict[str, Any]]:
         if not job.artifact_uri:
             raise ValueError("historical query job is missing its input artifact")
         payload = self.artifacts.read_json(job.artifact_uri)
@@ -785,6 +785,7 @@ class JobExecutor:
             "row_count": table.num_rows,
             "byte_size": size,
             "resolved_features": resolved,
+            "warnings": list(job.payload.get("warnings", [])),
         }
 
     def cleanup_expired_artifacts(self, *, now: datetime | None = None) -> int:
@@ -958,9 +959,7 @@ class JobExecutor:
             "skipped_entities": latest.num_rows - updated,
             "source_freshness_at": source_freshness.isoformat() if source_freshness else None,
             "freshness_lag_seconds": (
-                max(0.0, (end - source_freshness).total_seconds())
-                if source_freshness
-                else None
+                max(0.0, (end - source_freshness).total_seconds()) if source_freshness else None
             ),
             "resulting_watermark": (
                 resulting_watermark.isoformat() if resulting_watermark else None
