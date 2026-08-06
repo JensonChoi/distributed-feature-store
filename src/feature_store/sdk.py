@@ -17,8 +17,14 @@ from feature_store.models import (
     Observation,
     OnlineQuery,
     QueryResponse,
+    RegistryActivationRequest,
+    RegistryDeprecationRequest,
+    RegistryDescriptor,
     RegistryManifest,
+    RegistryMetadataPatch,
+    RegistryMetadataUpdate,
     RegistryPlan,
+    RegistryTarget,
 )
 
 
@@ -54,9 +60,7 @@ class FeatureStoreClient:
         return self.apply(self._manifest_file(path))
 
     def validate(self, manifest: RegistryManifest) -> RegistryPlan:
-        response = self._client.post(
-            "/v1/registry/validate", json=manifest.model_dump(mode="json")
-        )
+        response = self._client.post("/v1/registry/validate", json=manifest.model_dump(mode="json"))
         response.raise_for_status()
         return RegistryPlan.model_validate(response.json())
 
@@ -75,6 +79,56 @@ class FeatureStoreClient:
         response = self._client.get("/v1/registry", params={"kind": kind} if kind else None)
         response.raise_for_status()
         return cast(list[dict[str, Any]], response.json())
+
+    def describe_registry_object(self, target: RegistryTarget) -> RegistryDescriptor:
+        response = self._client.get(
+            "/v1/registry/object",
+            params=target.model_dump(mode="json", exclude_none=True),
+        )
+        response.raise_for_status()
+        return RegistryDescriptor.model_validate(response.json())
+
+    def patch_registry_metadata(
+        self, target: RegistryTarget, patch: RegistryMetadataPatch
+    ) -> RegistryDescriptor:
+        update = RegistryMetadataUpdate(target=target, patch=patch)
+        response = self._client.patch(
+            "/v1/registry/object/metadata", json=update.model_dump(mode="json")
+        )
+        response.raise_for_status()
+        return RegistryDescriptor.model_validate(response.json())
+
+    def deprecate_registry_object(
+        self,
+        target: RegistryTarget,
+        *,
+        message: str | None = None,
+        replacement: RegistryTarget | None = None,
+    ) -> RegistryDescriptor:
+        request = RegistryDeprecationRequest(
+            target=target, message=message, replacement=replacement
+        )
+        response = self._client.post(
+            "/v1/registry/object:deprecate",
+            json=request.model_dump(mode="json"),
+        )
+        response.raise_for_status()
+        return RegistryDescriptor.model_validate(response.json())
+
+    def activate_registry_object(self, target: RegistryTarget) -> RegistryDescriptor:
+        request = RegistryActivationRequest(target=target)
+        response = self._client.post(
+            "/v1/registry/object:activate", json=request.model_dump(mode="json")
+        )
+        response.raise_for_status()
+        return RegistryDescriptor.model_validate(response.json())
+
+    # Short aliases keep interactive SDK usage focused while retaining explicit method names.
+    describe_registry = describe_registry_object
+    update_registry_metadata = patch_registry_metadata
+    deprecate_registry = deprecate_registry_object
+    activate_registry = activate_registry_object
+    reactivate_registry_object = activate_registry_object
 
     def get_online_features(
         self,

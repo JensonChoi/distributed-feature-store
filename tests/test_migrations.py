@@ -107,9 +107,7 @@ def test_historical_artifact_migration_preserves_jobs_and_downgrades_sqlite(
         "artifacts_cleaned_at",
     } <= columns
     with engine.connect() as connection:
-        existing = connection.execute(
-            text("SELECT id FROM jobs WHERE id = 'existing'")
-        ).scalar()
+        existing = connection.execute(text("SELECT id FROM jobs WHERE id = 'existing'")).scalar()
     assert existing == "existing"
 
     command.downgrade(config, "0003")
@@ -149,5 +147,53 @@ def test_incremental_materialization_migration_upgrades_and_downgrades_sqlite(
     command.downgrade(config, "0004")
     assert "materialization_states" not in inspect(engine).get_table_names()
     assert "jobs" in inspect(engine).get_table_names()
+    engine.dispose()
+    get_settings.cache_clear()
+
+
+def test_registry_lifecycle_migration_preserves_records_and_downgrades_sqlite(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    database_path = tmp_path / "registry-lifecycle.db"
+    database_url = f"sqlite:///{database_path}"
+    monkeypatch.setenv("FS_DATABASE_URL", database_url)
+    get_settings.cache_clear()
+    config = Config("alembic.ini")
+    command.upgrade(config, "0005")
+    engine = make_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO registry_records "
+                "(id, kind, name, version, fingerprint, spec, created_at) VALUES "
+                "('record-1', 'entity', 'account', '', 'abc', "
+                '\'{"name": "account", "join_keys": {"account_id": "string"}}\', '
+                "'2025-01-01 00:00:00')"
+            )
+        )
+
+    command.upgrade(config, "0006")
+    columns = {column["name"] for column in inspect(engine).get_columns("registry_lifecycle")}
+    assert {
+        "registry_record_id",
+        "feature_name",
+        "owners",
+        "tags",
+        "documentation_links",
+        "status",
+        "deprecated_at",
+        "deprecation_message",
+        "replacement",
+        "updated_at",
+    } <= columns
+    with engine.connect() as connection:
+        assert (
+            connection.execute(text("SELECT id FROM registry_records WHERE id='record-1'")).scalar()
+            == "record-1"
+        )
+
+    command.downgrade(config, "0005")
+    assert "registry_lifecycle" not in inspect(engine).get_table_names()
+    assert "registry_records" in inspect(engine).get_table_names()
     engine.dispose()
     get_settings.cache_clear()

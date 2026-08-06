@@ -83,13 +83,20 @@ diffs. The API and typed SDK expose the workflow, while nested registry CLI comm
 and return a failing exit status for rejected plans. Apply uses the same preflight before its
 atomic commit, and the original top-level apply and list commands remain compatibility aliases.
 
-## Next: developer and operator experience
-
 ### Registry lifecycle metadata
 
-Support owners, tags, documentation links, creation provenance, deprecation status, and
-replacement references without making versioned definitions mutable. Allow deprecated features
-to remain readable while warning new consumers.
+Registry objects and individual pinned features now support mutable owners, tags, HTTP(S)
+documentation links, and deprecation guidance without changing immutable specifications or
+fingerprints. Descriptors derive creation provenance from the original registry record.
+Replacement targets are validated for existence, compatibility, active status, and safe graph
+relationships, while reactivation preserves discovery metadata.
+
+Planning, apply, online reads, and historical reads return deterministic advisory warnings for
+deprecated services, features, parent views, entities, and sources. Feature-view deprecation is
+inherited by its features without cascaded writes, and asynchronous historical jobs snapshot
+their warnings for reproducible job and result metadata. Deprecated targets remain readable.
+
+## Next: developer and operator experience
 
 ### Data quality contracts
 

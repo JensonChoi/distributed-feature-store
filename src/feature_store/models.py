@@ -6,6 +6,7 @@ import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -271,12 +272,6 @@ def validate_feature_value(dtype: ValueType, value: Any) -> None:
         raise ValueError(f"value {value!r} does not match {dtype}")
 
 
-class ApplyResult(StrictModel):
-    fingerprint: str
-    created: int
-    unchanged: int
-
-
 class RegistryObjectStatus(StrEnum):
     CREATED = "created"
     UNCHANGED = "unchanged"
@@ -289,6 +284,182 @@ class RegistryObjectKind(StrEnum):
     STREAM_SOURCE = "stream_source"
     FEATURE_VIEW = "feature_view"
     FEATURE_SERVICE = "feature_service"
+
+
+class RegistryLifecycleStatus(StrEnum):
+    ACTIVE = "active"
+    DEPRECATED = "deprecated"
+
+
+class RegistryTarget(StrictModel):
+    kind: RegistryObjectKind
+    name: str
+    version: str | None = None
+    feature: str | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self) -> RegistryTarget:
+        if not NAME_PATTERN.fullmatch(self.name):
+            raise ValueError("registry target name must be lowercase snake_case")
+        if self.kind == RegistryObjectKind.FEATURE_VIEW:
+            if self.version is None or not VERSION_PATTERN.fullmatch(self.version):
+                raise ValueError("feature view targets require a semantic version")
+        elif self.version is not None:
+            raise ValueError("only feature view targets accept a version")
+        if self.feature is not None:
+            if self.kind != RegistryObjectKind.FEATURE_VIEW:
+                raise ValueError("only feature view targets accept a feature")
+            if not NAME_PATTERN.fullmatch(self.feature):
+                raise ValueError("feature target name must be lowercase snake_case")
+        return self
+
+    @property
+    def ref(self) -> str:
+        suffix = f"@{self.version}" if self.version else ""
+        feature = f":{self.feature}" if self.feature else ""
+        return f"{self.kind}:{self.name}{suffix}{feature}"
+
+
+def _validate_metadata_values(
+    owners: list[str] | None,
+    tags: dict[str, str] | None,
+    documentation_links: list[str] | None,
+) -> tuple[list[str] | None, dict[str, str] | None, list[str] | None]:
+    if owners is not None:
+        if len(owners) > 100 or any(not owner.strip() or len(owner) > 256 for owner in owners):
+            raise ValueError("owners must contain 100 or fewer non-empty strings")
+        if len(owners) != len(set(owners)):
+            raise ValueError("owners must be unique")
+    if tags is not None and (
+        len(tags) > 100
+        or any(not key.strip() or len(key) > 128 or len(value) > 512 for key, value in tags.items())
+    ):
+        raise ValueError("tags must contain 100 or fewer bounded string pairs")
+    if documentation_links is not None:
+        if len(documentation_links) > 100 or len(documentation_links) != len(
+            set(documentation_links)
+        ):
+            raise ValueError("documentation links must be unique and contain at most 100 URLs")
+        for link in documentation_links:
+            parsed = urlparse(link)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or len(link) > 2048:
+                raise ValueError("documentation links must be HTTP(S) URLs")
+    return owners, tags, documentation_links
+
+
+class RegistryMetadata(StrictModel):
+    owners: list[str] = []
+    tags: dict[str, str] = {}
+    documentation_links: list[str] = []
+
+    @model_validator(mode="after")
+    def validate_metadata(self) -> RegistryMetadata:
+        _validate_metadata_values(self.owners, self.tags, self.documentation_links)
+        return self
+
+
+class RegistryMetadataPatch(StrictModel):
+    owners: list[str] | None = None
+    tags: dict[str, str] | None = None
+    documentation_links: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> RegistryMetadataPatch:
+        if not self.model_fields_set:
+            raise ValueError("metadata patch must set at least one field")
+        _validate_metadata_values(self.owners, self.tags, self.documentation_links)
+        return self
+
+
+class RegistryProvenance(StrictModel):
+    created_at: datetime
+    manifest_fingerprint: str
+
+
+class RegistryDeprecation(StrictModel):
+    status: RegistryLifecycleStatus = RegistryLifecycleStatus.ACTIVE
+    deprecated_at: datetime | None = None
+    message: str | None = None
+    replacement: RegistryTarget | None = None
+
+
+class RegistryDescriptor(StrictModel):
+    target: RegistryTarget
+    fingerprint: str
+    spec: dict[str, Any]
+    provenance: RegistryProvenance
+    metadata: RegistryMetadata = RegistryMetadata()
+    deprecation: RegistryDeprecation = RegistryDeprecation()
+    updated_at: datetime | None = None
+
+
+class RegistryWarning(StrictModel):
+    code: Literal["deprecated_registry_target"] = "deprecated_registry_target"
+    target: RegistryTarget
+    message: str
+    deprecated_at: datetime
+    replacement: RegistryTarget | None = None
+    inherited_from: RegistryTarget | None = None
+
+
+class RegistryMetadataUpdate(StrictModel):
+    target: RegistryTarget
+    patch: RegistryMetadataPatch
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_flat_patch(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "patch" not in value:
+            patch_fields = {
+                key: value[key] for key in ("owners", "tags", "documentation_links") if key in value
+            }
+            if patch_fields:
+                return {"target": value.get("target"), "patch": patch_fields}
+        return value
+
+
+class RegistryDeprecationRequest(StrictModel):
+    target: RegistryTarget
+    message: str | None = Field(default=None, max_length=2000)
+    replacement: RegistryTarget | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_flat_target(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "target" not in value:
+            target = {
+                key: value[key] for key in ("kind", "name", "version", "feature") if key in value
+            }
+            return {
+                "target": target,
+                "message": value.get("message"),
+                "replacement": value.get("replacement"),
+            }
+        return value
+
+
+class RegistryActivationRequest(StrictModel):
+    target: RegistryTarget
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_flat_target(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "target" not in value:
+            return {
+                "target": {
+                    key: value[key]
+                    for key in ("kind", "name", "version", "feature")
+                    if key in value
+                }
+            }
+        return value
+
+
+class ApplyResult(StrictModel):
+    fingerprint: str
+    created: int
+    unchanged: int
+    warnings: list[RegistryWarning] = []
 
 
 class RegistryIssueCode(StrEnum):
@@ -342,6 +513,7 @@ class RegistryPlan(StrictModel):
     fingerprint: str
     summary: RegistryPlanSummary
     objects: list[RegistryObjectPlan]
+    warnings: list[RegistryWarning] = []
 
 
 class QueryStatus(StrEnum):
@@ -353,6 +525,7 @@ class QueryStatus(StrEnum):
 class QueryResponse(StrictModel):
     resolved_features: list[str]
     rows: list[dict[str, Any]]
+    warnings: list[RegistryWarning] = []
 
 
 class HistoricalResult(StrictModel):
@@ -361,6 +534,7 @@ class HistoricalResult(StrictModel):
     row_count: int
     byte_size: int
     resolved_features: list[str]
+    warnings: list[RegistryWarning] = []
     download_url: str
     expires_at: datetime
     cleaned_up: bool = False

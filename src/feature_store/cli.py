@@ -9,6 +9,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
+from feature_store.models import RegistryMetadataPatch, RegistryObjectKind, RegistryTarget
 from feature_store.sdk import FeatureStoreClient
 
 app = typer.Typer(no_args_is_help=True, help="Operate the distributed feature store.")
@@ -61,6 +62,118 @@ def registry_apply(path: Annotated[Path, typer.Argument(exists=True, readable=Tr
 @registry_app.command("list")
 def registry_list(kind: Annotated[str | None, typer.Option()] = None) -> None:
     list_objects(kind)
+
+
+def _target(
+    kind: RegistryObjectKind,
+    name: str,
+    version: str | None,
+    feature: str | None,
+) -> RegistryTarget:
+    try:
+        return RegistryTarget(kind=kind, name=name, version=version, feature=feature)
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@registry_app.command("describe")
+def registry_describe(
+    kind: RegistryObjectKind,
+    name: str,
+    version: Annotated[str | None, typer.Option()] = None,
+    feature: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    target = _target(kind, name, version, feature)
+    with FeatureStoreClient() as client:
+        _print(client.describe_registry_object(target).model_dump(mode="json"))
+
+
+@registry_app.command("metadata")
+def registry_metadata(
+    kind: RegistryObjectKind,
+    name: str,
+    version: Annotated[str | None, typer.Option()] = None,
+    feature: Annotated[str | None, typer.Option()] = None,
+    owner: Annotated[list[str] | None, typer.Option("--owner")] = None,
+    tag: Annotated[list[str] | None, typer.Option("--tag", help="KEY=VALUE")] = None,
+    documentation: Annotated[list[str] | None, typer.Option("--documentation", "--doc")] = None,
+    clear_owners: Annotated[bool, typer.Option()] = False,
+    clear_tags: Annotated[bool, typer.Option()] = False,
+    clear_documentation: Annotated[bool, typer.Option()] = False,
+) -> None:
+    if owner and clear_owners:
+        raise typer.BadParameter("--owner and --clear-owners cannot be combined")
+    if tag and clear_tags:
+        raise typer.BadParameter("--tag and --clear-tags cannot be combined")
+    if documentation and clear_documentation:
+        raise typer.BadParameter("--documentation and --clear-documentation cannot be combined")
+    values: dict[str, object] = {}
+    if owner is not None or clear_owners:
+        values["owners"] = [] if clear_owners else owner
+    if tag is not None or clear_tags:
+        parsed_tags: dict[str, str] = {}
+        for item in tag or []:
+            if "=" not in item or not item.split("=", 1)[0]:
+                raise typer.BadParameter("--tag values must use KEY=VALUE")
+            key, value = item.split("=", 1)
+            if key in parsed_tags:
+                raise typer.BadParameter(f"duplicate tag key: {key}")
+            parsed_tags[key] = value
+        values["tags"] = {} if clear_tags else parsed_tags
+    if documentation is not None or clear_documentation:
+        values["documentation_links"] = [] if clear_documentation else documentation
+    if not values:
+        raise typer.BadParameter("provide metadata values or an explicit clear flag")
+    target = _target(kind, name, version, feature)
+    try:
+        patch = RegistryMetadataPatch.model_validate(values)
+    except ValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    with FeatureStoreClient() as client:
+        _print(client.patch_registry_metadata(target, patch).model_dump(mode="json"))
+
+
+@registry_app.command("deprecate")
+def registry_deprecate(
+    kind: RegistryObjectKind,
+    name: str,
+    version: Annotated[str | None, typer.Option()] = None,
+    feature: Annotated[str | None, typer.Option()] = None,
+    message: Annotated[str | None, typer.Option()] = None,
+    replacement: Annotated[str | None, typer.Option(help="Replacement object name")] = None,
+    replacement_version: Annotated[str | None, typer.Option()] = None,
+    replacement_feature: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    target = _target(kind, name, version, feature)
+    if replacement is None and (replacement_version or replacement_feature):
+        raise typer.BadParameter("replacement options require --replacement")
+    replacement_target = (
+        _target(
+            kind,
+            replacement,
+            replacement_version,
+            replacement_feature if replacement_feature is not None else feature,
+        )
+        if replacement
+        else None
+    )
+    with FeatureStoreClient() as client:
+        result = client.deprecate_registry_object(
+            target, message=message, replacement=replacement_target
+        )
+        _print(result.model_dump(mode="json"))
+
+
+@registry_app.command("activate")
+def registry_activate(
+    kind: RegistryObjectKind,
+    name: str,
+    version: Annotated[str | None, typer.Option()] = None,
+    feature: Annotated[str | None, typer.Option()] = None,
+) -> None:
+    target = _target(kind, name, version, feature)
+    with FeatureStoreClient() as client:
+        _print(client.activate_registry_object(target).model_dump(mode="json"))
 
 
 @app.command("online-read")

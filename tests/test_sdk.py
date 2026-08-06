@@ -6,7 +6,7 @@ from pathlib import Path
 
 import httpx
 
-from feature_store.models import RegistryManifest
+from feature_store.models import RegistryManifest, RegistryMetadataPatch, RegistryTarget
 from feature_store.sdk import FeatureStoreClient
 
 
@@ -165,3 +165,53 @@ def test_sdk_registry_plan_methods_parse_typed_responses(
         "/v1/registry/plan",
         "/v1/registry/plan",
     ]
+
+
+def test_sdk_registry_lifecycle_methods_use_typed_contracts() -> None:
+    calls: list[tuple[str, str, object]] = []
+    target = RegistryTarget(kind="entity", name="account")
+    descriptor = {
+        "target": target.model_dump(mode="json"),
+        "fingerprint": "abc",
+        "spec": {"name": "account", "join_keys": {"account_id": "string"}},
+        "provenance": {
+            "created_at": "2025-01-01T00:00:00Z",
+            "manifest_fingerprint": "abc",
+        },
+        "metadata": {"owners": [], "tags": {}, "documentation_links": []},
+        "deprecation": {
+            "status": "active",
+            "deprecated_at": None,
+            "message": None,
+            "replacement": None,
+        },
+        "updated_at": None,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        return httpx.Response(200, json=descriptor)
+
+    with FeatureStoreClient(
+        "http://feature-store", transport=httpx.MockTransport(handler)
+    ) as client:
+        assert client.describe_registry_object(target).target == target
+        client.patch_registry_metadata(target, RegistryMetadataPatch(owners=["fraud-team"]))
+        client.deprecate_registry_object(target, message="retiring")
+        client.activate_registry_object(target)
+
+    assert [(method, path) for method, path, _ in calls] == [
+        ("GET", "/v1/registry/object"),
+        ("PATCH", "/v1/registry/object/metadata"),
+        ("POST", "/v1/registry/object:deprecate"),
+        ("POST", "/v1/registry/object:activate"),
+    ]
+    assert calls[1][2] == {
+        "target": {"kind": "entity", "name": "account", "version": None, "feature": None},
+        "patch": {
+            "owners": ["fraud-team"],
+            "tags": None,
+            "documentation_links": None,
+        },
+    }

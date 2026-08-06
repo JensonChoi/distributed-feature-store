@@ -29,8 +29,14 @@ from feature_store.models import (
     JobResponse,
     OnlineQuery,
     QueryResponse,
+    RegistryActivationRequest,
+    RegistryDeprecationRequest,
+    RegistryDescriptor,
     RegistryManifest,
+    RegistryMetadataUpdate,
+    RegistryObjectKind,
     RegistryPlan,
+    RegistryTarget,
 )
 from feature_store.observability import METRICS, configure_logging
 from feature_store.offline import OfflineStore
@@ -139,6 +145,42 @@ def list_registry(
     return Registry(session).list_records(kind)
 
 
+@app.get("/v1/registry/object", response_model=RegistryDescriptor)
+def describe_registry_object(
+    kind: RegistryObjectKind,
+    name: str,
+    version: str | None = None,
+    feature: str | None = None,
+    session: Session = Depends(get_session),
+) -> RegistryDescriptor:
+    return Registry(session).describe(
+        RegistryTarget(kind=kind, name=name, version=version, feature=feature)
+    )
+
+
+@app.patch("/v1/registry/object/metadata", response_model=RegistryDescriptor)
+def patch_registry_metadata(
+    update: RegistryMetadataUpdate, session: Session = Depends(get_session)
+) -> RegistryDescriptor:
+    return Registry(session).patch_metadata(update.target, update.patch)
+
+
+@app.post("/v1/registry/object:deprecate", response_model=RegistryDescriptor)
+def deprecate_registry_object(
+    request: RegistryDeprecationRequest, session: Session = Depends(get_session)
+) -> RegistryDescriptor:
+    return Registry(session).deprecate(
+        request.target, message=request.message, replacement=request.replacement
+    )
+
+
+@app.post("/v1/registry/object:activate", response_model=RegistryDescriptor)
+def activate_registry_object(
+    request: RegistryActivationRequest, session: Session = Depends(get_session)
+) -> RegistryDescriptor:
+    return Registry(session).reactivate(request.target)
+
+
 @app.post("/v1/online-features:read", response_model=QueryResponse)
 def online_read(query: OnlineQuery, session: Session = Depends(get_session)) -> QueryResponse:
     return OnlineStore().read(
@@ -155,7 +197,10 @@ def historical_query(
     retriever = HistoricalRetriever(Registry(session), OfflineStore())
     if len(query.observations) > get_settings().inline_query_limit:
         resolved = retriever.validate(query.observations, query.features, query.feature_service)
-        job = JobService(session).create_historical_query(query, resolved, artifacts)
+        warnings = retriever.registry.warnings_for_query(query.features, query.feature_service)
+        job = JobService(session).create_historical_query(
+            query, resolved, artifacts, warnings=warnings
+        )
         return JSONResponse(
             status_code=202,
             content=jsonable_encoder(JobResponse.model_validate(serialize_job(job))),

@@ -4,7 +4,18 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, DateTime, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -27,6 +38,36 @@ class RegistryRecord(Base):
     fingerprint: Mapped[str] = mapped_column(String(64))
     spec: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
+
+
+class RegistryLifecycleRecord(Base):
+    __tablename__ = "registry_lifecycle"
+    __table_args__ = (
+        UniqueConstraint("registry_record_id", "feature_name"),
+        Index(
+            "uq_registry_lifecycle_object",
+            "registry_record_id",
+            unique=True,
+            sqlite_where=text("feature_name IS NULL"),
+            postgresql_where=text("feature_name IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    registry_record_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("registry_records.id", ondelete="CASCADE"), index=True
+    )
+    feature_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    owners: Mapped[list[str]] = mapped_column(JSON, default=list)
+    tags: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    documentation_links: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="active")
+    deprecated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deprecation_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    replacement: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)
     )
 

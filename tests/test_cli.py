@@ -11,9 +11,7 @@ from feature_store.cli import app
 from feature_store.models import RegistryPlan, RegistryPlanSummary
 
 
-def test_job_result_command_streams_to_requested_output(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_job_result_command_streams_to_requested_output(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     output = tmp_path / "result.parquet"
 
     class FakeClient:
@@ -172,3 +170,74 @@ def test_registry_command_reports_invalid_manifest(tmp_path: Path) -> None:
     result = CliRunner().invoke(app, ["registry", "validate", str(path)])
     assert result.exit_code == 2
     assert "error" in json.loads(result.output)
+
+
+def test_registry_lifecycle_commands_forward_typed_targets_and_clear_flags(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[str, object]] = []
+
+    class Result:
+        def model_dump(self, *, mode: str) -> dict[str, object]:
+            assert mode == "json"
+            return {"ok": True}
+
+    class FakeClient:
+        def __enter__(self) -> FakeClient:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def describe_registry_object(self, target: object) -> Result:
+            calls.append(("describe", target))
+            return Result()
+
+        def patch_registry_metadata(self, target: object, patch: object) -> Result:
+            calls.append(("metadata", (target, patch)))
+            return Result()
+
+        def deprecate_registry_object(self, target: object, **kwargs: object) -> Result:
+            calls.append(("deprecate", (target, kwargs)))
+            return Result()
+
+        def activate_registry_object(self, target: object) -> Result:
+            calls.append(("activate", target))
+            return Result()
+
+    monkeypatch.setattr("feature_store.cli.FeatureStoreClient", FakeClient)
+    runner = CliRunner()
+    commands = [
+        ["registry", "describe", "feature_view", "account_stats", "--version", "1.0.0"],
+        [
+            "registry",
+            "metadata",
+            "entity",
+            "account",
+            "--owner",
+            "fraud-team",
+            "--tag",
+            "tier=critical",
+            "--clear-documentation",
+        ],
+        ["registry", "deprecate", "entity", "account", "--message", "retiring"],
+        ["registry", "activate", "entity", "account"],
+    ]
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == {"ok": True}
+    assert [name for name, _ in calls] == ["describe", "metadata", "deprecate", "activate"]
+    patch = calls[1][1][1]  # type: ignore[index]
+    assert patch.owners == ["fraud-team"]
+    assert patch.tags == {"tier": "critical"}
+    assert patch.documentation_links == []
+
+
+def test_registry_metadata_command_rejects_ambiguous_or_empty_updates() -> None:
+    runner = CliRunner()
+    empty = runner.invoke(app, ["registry", "metadata", "entity", "account"])
+    assert empty.exit_code == 2
+    ambiguous = runner.invoke(
+        app,
+        ["registry", "metadata", "entity", "account", "--owner", "team", "--clear-owners"],
+    )
+    assert ambiguous.exit_code == 2
