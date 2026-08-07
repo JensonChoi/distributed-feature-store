@@ -189,6 +189,12 @@ class Metrics:
             ["reason"],
             registry=registry,
         )
+        self.quality_violations = Counter(
+            "feature_store_data_quality_violations_total",
+            "Data quality violations by bounded contract dimensions.",
+            ["feature_view", "path", "policy", "constraint_type"],
+            registry=registry,
+        )
 
 
 METRICS = Metrics()

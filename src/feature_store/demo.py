@@ -106,7 +106,7 @@ def run_demo() -> dict[str, Any]:
     return {
         "seeded_transactions": count,
         "registry": applied.model_dump(mode="json"),
-        "backfill_job": backfill,
+        "backfill_job": backfill.model_dump(mode="json"),
         "next": "Wait for the job to succeed, then run `feature-store demo-stream`.",
     }
 

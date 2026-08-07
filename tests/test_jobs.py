@@ -12,10 +12,12 @@ from feature_store.db import JobRecord, MaterializationState, StreamEventRecord
 from feature_store.jobs import JobExecutor, JobService, LeaseLostError, serialize_job
 from feature_store.ledger import StreamEventLedger
 from feature_store.models import (
+    FeatureQuality,
     IncrementalMaterializationRequest,
     JobKind,
     JobRequest,
     JobStatus,
+    QualityPolicy,
     RegistryManifest,
     StreamEventState,
     StreamFeatureEvent,
@@ -110,6 +112,92 @@ def test_backfill_job_writes_versioned_offline_table(
     preserved = offline.load(offline.view_uri("account_stats@1.0.0"))
     assert partial.status == JobStatus.SUCCEEDED, partial.error
     assert preserved["amount"].to_pylist() == [12.5]
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_status", "expected_rows"),
+    [
+        (QualityPolicy.REJECT, JobStatus.FAILED, None),
+        (QualityPolicy.QUARANTINE, JobStatus.SUCCEEDED, [2.0]),
+        (QualityPolicy.REPORT, JobStatus.SUCCEEDED, [-1.0, 2.0]),
+    ],
+)
+def test_backfill_quality_policies(
+    tmp_path: Path,
+    session: Session,
+    manifest: RegistryManifest,
+    policy: QualityPolicy,
+    expected_status: JobStatus,
+    expected_rows: list[float] | None,
+) -> None:
+    class QualityOfflineStore(LocalOfflineStore):
+        def quarantine_uri(self, view_ref: str, job_id: str) -> str:
+            return str(self.root / "quarantine" / view_ref.replace("@", "_") / job_id)
+
+    offline = QualityOfflineStore(tmp_path)
+    source_uri = str(tmp_path / "source")
+    changed = manifest.model_copy(deep=True)
+    changed.batch_sources[0].uri = source_uri
+    changed.feature_views[0].quality_policy = policy
+    changed.feature_views[0].features[0].quality = FeatureQuality(nullable=False, minimum=0)
+    Registry(session).apply(changed)
+    start = datetime(2025, 1, 1, tzinfo=UTC)
+    offline.append(
+        source_uri,
+        pa.Table.from_pylist(
+            [
+                {
+                    "account_id": "a",
+                    "event_timestamp": start + timedelta(minutes=1),
+                    "event_id": "invalid",
+                    "amount": -1.0,
+                },
+                {
+                    "account_id": "b",
+                    "event_timestamp": start + timedelta(minutes=2),
+                    "event_id": "valid",
+                    "amount": 2.0,
+                },
+            ]
+        ),
+    )
+    job = JobService(session).create(
+        JobKind.BACKFILL,
+        JobRequest(
+            feature_view="account_stats@1.0.0",
+            start=start,
+            end=start + timedelta(days=1),
+        ),
+    )
+    executor = JobExecutor(session, offline=offline)
+    executor.execute(claim(executor, job.id))
+
+    assert job.status == expected_status, job.error
+    target = offline.view_uri("account_stats@1.0.0")
+    if expected_rows is None:
+        assert not offline.exists(target)
+        assert job.result_metadata is not None
+        assert job.result_metadata["evaluated_rows"] == 2
+        assert job.result_metadata["invalid_rows"] == 1
+        return
+    assert offline.load(target)["amount"].to_pylist() == expected_rows
+    assert job.result_metadata is not None
+    assert job.result_metadata["evaluated_rows"] == 2
+    assert job.result_metadata["invalid_rows"] == 1
+    assert job.result_metadata["counts_by_constraint"] == {"minimum": 1}
+    if policy == QualityPolicy.QUARANTINE:
+        quarantine = offline.load(offline.quarantine_uri("account_stats@1.0.0", job.id))
+        assert quarantine["amount"].to_pylist() == [-1.0]
+        assert quarantine["quality_errors"].to_pylist() == [["amount:minimum"]]
+        assert job.result_metadata["quarantined_rows"] == 1
+
+        job.status = JobStatus.PENDING
+        job.worker_id = None
+        job.lease_token = None
+        job.lease_expires_at = None
+        session.commit()
+        executor.execute(claim(executor, job.id))
+        assert offline.load(offline.quarantine_uri("account_stats@1.0.0", job.id)).num_rows == 1
 
 
 def test_expired_jobs_are_reclaimed_and_failed_jobs_can_retry(

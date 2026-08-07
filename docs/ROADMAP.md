@@ -13,6 +13,15 @@ correctness and operability before horizontal scale or a broader product surface
 
 ## Delivered
 
+### Data quality contracts
+
+Immutable per-feature contracts now cover nullability, inclusive numeric ranges, accepted
+categories, execution-bounded uniqueness, and event freshness. One deterministic validator is
+shared by transformed batch chunks and stream events while physical schema checks remain
+mandatory. Feature views choose reject, quarantine, or report handling; backfills persist
+recovery-safe cumulative summaries and stream enforcement runs before ledger, online, or
+offline mutations. Prometheus diagnostics use bounded contract labels and never row values.
+
 ### End-to-end streaming deduplication
 
 Streaming events now have a durable identity scoped to `(feature_view, event_id)`. Postgres
@@ -97,12 +106,6 @@ inherited by its features without cascaded writes, and asynchronous historical j
 their warnings for reproducible job and result metadata. Deprecated targets remain readable.
 
 ## Next: developer and operator experience
-
-### Data quality contracts
-
-Let feature definitions declare nullability, numeric ranges, accepted categories, uniqueness,
-and freshness expectations. Validate batch outputs and streaming events consistently, with a
-configurable choice to reject, quarantine, or report invalid data.
 
 ### Scheduled jobs
 

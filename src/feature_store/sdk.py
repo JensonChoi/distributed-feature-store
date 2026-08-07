@@ -174,10 +174,10 @@ class FeatureStoreClient:
                     destination.write(chunk)
         return path
 
-    def backfill(self, feature_view: str, start: datetime, end: datetime) -> dict[str, Any]:
+    def backfill(self, feature_view: str, start: datetime, end: datetime) -> JobResponse:
         return self._create_job("backfills", feature_view, start, end)
 
-    def materialize(self, feature_view: str, start: datetime, end: datetime) -> dict[str, Any]:
+    def materialize(self, feature_view: str, start: datetime, end: datetime) -> JobResponse:
         return self._create_job("materializations", feature_view, start, end)
 
     def materialize_incremental(
@@ -199,28 +199,28 @@ class FeatureStoreClient:
         response.raise_for_status()
         return cast(dict[str, Any], response.json())
 
-    def job(self, job_id: str) -> dict[str, Any]:
+    def job(self, job_id: str) -> JobResponse:
         response = self._client.get(f"/v1/jobs/{job_id}")
         response.raise_for_status()
-        return cast(dict[str, Any], response.json())
+        return JobResponse.model_validate(response.json())
 
-    def jobs(self) -> list[dict[str, Any]]:
+    def jobs(self) -> list[JobResponse]:
         response = self._client.get("/v1/jobs")
         response.raise_for_status()
-        return cast(list[dict[str, Any]], response.json())
+        return [JobResponse.model_validate(item) for item in response.json()]
 
-    def retry_job(self, job_id: str) -> dict[str, Any]:
+    def retry_job(self, job_id: str) -> JobResponse:
         response = self._client.post(f"/v1/jobs/{job_id}:retry")
         response.raise_for_status()
-        return cast(dict[str, Any], response.json())
+        return JobResponse.model_validate(response.json())
 
     def _create_job(
         self, kind: str, feature_view: str, start: datetime, end: datetime
-    ) -> dict[str, Any]:
+    ) -> JobResponse:
         request = JobRequest(feature_view=feature_view, start=start, end=end)
         response = self._client.post(f"/v1/jobs/{kind}", json=request.model_dump(mode="json"))
         response.raise_for_status()
-        return cast(dict[str, Any], response.json())
+        return JobResponse.model_validate(response.json())
 
     @staticmethod
     def _manifest_file(path: str | Path) -> RegistryManifest:

@@ -29,6 +29,61 @@ class ValueType(StrEnum):
     TIMESTAMP = "timestamp"
 
 
+class QualityPolicy(StrEnum):
+    REJECT = "reject"
+    QUARANTINE = "quarantine"
+    REPORT = "report"
+
+
+class QualityConstraintType(StrEnum):
+    NULLABLE = "nullable"
+    MINIMUM = "minimum"
+    MAXIMUM = "maximum"
+    ACCEPTED_VALUES = "accepted_values"
+    UNIQUE = "unique"
+    MAX_AGE_SECONDS = "max_age_seconds"
+
+
+class FeatureQuality(StrictModel):
+    nullable: bool = True
+    minimum: int | float | None = None
+    maximum: int | float | None = None
+    accepted_values: list[Any] | None = None
+    unique: bool = False
+    max_age_seconds: int | None = Field(default=None, ge=0)
+
+    @field_validator("minimum", "maximum", mode="before")
+    @classmethod
+    def bounds_are_numeric(cls, value: Any) -> Any:
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+        ):
+            raise ValueError("quality bounds must be numeric")
+        return value
+
+    @field_validator("max_age_seconds", mode="before")
+    @classmethod
+    def age_is_integer(cls, value: Any) -> Any:
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("max_age_seconds must be an integer")
+        return value
+
+    @model_validator(mode="after")
+    def valid_range(self) -> FeatureQuality:
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError("quality minimum cannot exceed maximum")
+        if self.accepted_values is not None:
+            if not self.accepted_values:
+                raise ValueError("accepted_values must not be empty")
+            canonical = [
+                json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+                for value in self.accepted_values
+            ]
+            if len(canonical) != len(set(canonical)):
+                raise ValueError("accepted_values must be unique")
+        return self
+
+
 class Entity(StrictModel):
     name: str
     join_keys: dict[str, ValueType]
@@ -75,6 +130,7 @@ class Feature(StrictModel):
     name: str
     dtype: ValueType
     description: str = ""
+    quality: FeatureQuality | None = None
 
     @field_validator("name")
     @classmethod
@@ -82,6 +138,44 @@ class Feature(StrictModel):
         if not NAME_PATTERN.fullmatch(value):
             raise ValueError("feature name must be lowercase snake_case")
         return value
+
+    @model_validator(mode="after")
+    def validate_quality(self) -> Feature:
+        quality = self.quality
+        if quality is None:
+            return self
+        if (quality.minimum is not None or quality.maximum is not None) and self.dtype not in {
+            ValueType.INT64,
+            ValueType.FLOAT64,
+        }:
+            raise ValueError("minimum and maximum require an int64 or float64 feature")
+        if self.dtype == ValueType.INT64:
+            for bound in (quality.minimum, quality.maximum):
+                if bound is not None and (not isinstance(bound, int) or isinstance(bound, bool)):
+                    raise ValueError("int64 bounds must be integers")
+        if quality.accepted_values is not None:
+            if self.dtype == ValueType.TIMESTAMP:
+                raise ValueError(
+                    "accepted_values are only supported for scalar categorical features"
+                )
+            for value in quality.accepted_values:
+                if value is None:
+                    raise ValueError("accepted_values cannot contain null")
+                try:
+                    validate_feature_value(self.dtype, value)
+                except ValueError as exc:
+                    raise ValueError("accepted_values must match the feature dtype") from exc
+            if self.dtype == ValueType.FLOAT64:
+                numeric = [float(value) for value in quality.accepted_values]
+                if len(numeric) != len(set(numeric)):
+                    raise ValueError("accepted_values must be unique")
+        return self
+
+    def registry_spec(self) -> dict[str, Any]:
+        spec = self.model_dump(mode="json")
+        if self.quality is None:
+            spec.pop("quality", None)
+        return spec
 
 
 class FeatureView(StrictModel):
@@ -94,6 +188,7 @@ class FeatureView(StrictModel):
     stream_source: str | None = None
     ttl_seconds: int | None = Field(default=None, gt=0)
     description: str = ""
+    quality_policy: QualityPolicy | None = None
 
     @model_validator(mode="after")
     def validate_view(self) -> FeatureView:
@@ -113,6 +208,17 @@ class FeatureView(StrictModel):
     @property
     def ref(self) -> str:
         return f"{self.name}@{self.version}"
+
+    @property
+    def effective_quality_policy(self) -> QualityPolicy:
+        return self.quality_policy or QualityPolicy.REJECT
+
+    def registry_spec(self) -> dict[str, Any]:
+        spec = self.model_dump(mode="json")
+        if self.quality_policy is None:
+            spec.pop("quality_policy", None)
+        spec["features"] = [feature.registry_spec() for feature in self.features]
+        return spec
 
 
 class FeatureService(StrictModel):
@@ -140,7 +246,9 @@ class RegistryManifest(StrictModel):
     feature_services: list[FeatureService] = []
 
     def fingerprint(self) -> str:
-        payload = json.dumps(self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        spec = self.model_dump(mode="json")
+        spec["feature_views"] = [view.registry_spec() for view in self.feature_views]
+        payload = json.dumps(spec, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -554,6 +662,15 @@ class MaterializationSummary(StrictModel):
     resulting_watermark: datetime | None
 
 
+class DataQualitySummary(StrictModel):
+    policy: QualityPolicy
+    evaluated_rows: int = Field(ge=0)
+    valid_rows: int = Field(ge=0)
+    invalid_rows: int = Field(ge=0)
+    quarantined_rows: int = Field(ge=0)
+    counts_by_constraint: dict[QualityConstraintType, int] = {}
+
+
 class JobResponse(StrictModel):
     id: str
     kind: JobKind
@@ -573,7 +690,7 @@ class JobResponse(StrictModel):
     finished_at: datetime | None
     artifact_expires_at: datetime | None = None
     artifacts_cleaned_at: datetime | None = None
-    result: HistoricalResult | MaterializationSummary | None = None
+    result: HistoricalResult | MaterializationSummary | DataQualitySummary | None = None
 
 
 JsonObject = dict[str, Any]

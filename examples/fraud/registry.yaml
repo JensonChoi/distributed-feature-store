@@ -20,16 +20,29 @@ feature_views:
     batch_source: transactions
     stream_source: account_features_stream
     ttl_seconds: 86400
+    quality_policy: report
     description: Rolling account transaction signals for fraud scoring.
     features:
       - name: txn_count_1h
         dtype: int64
+        quality:
+          nullable: false
+          minimum: 0
       - name: amount_sum_24h
         dtype: float64
+        quality:
+          nullable: false
+          minimum: 0
       - name: country_mismatch
         dtype: bool
+        quality:
+          nullable: false
+          accepted_values: [true, false]
       - name: account_age_days
         dtype: int64
+        quality:
+          nullable: false
+          minimum: 0
     batch_sql: |
       SELECT
         account_id,

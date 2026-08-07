@@ -511,7 +511,7 @@ class Registry:
         if target.feature is not None:
             view = FeatureView.model_validate(record.spec)
             spec = next(
-                feature.model_dump(mode="json")
+                feature.registry_spec()
                 for feature in view.features
                 if feature.name == target.feature
             )
@@ -715,7 +715,7 @@ class Registry:
             for item in manifest.stream_sources
         )
         objects.extend(
-            ("feature_view", item.name, item.version, item.model_dump(mode="json"))
+            ("feature_view", item.name, item.version, item.registry_spec())
             for item in manifest.feature_views
         )
         objects.extend(

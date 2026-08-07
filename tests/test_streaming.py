@@ -5,12 +5,20 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pyarrow as pa
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from feature_store.db import JobRecord, StreamEventRecord
 from feature_store.ledger import StreamEventLedger
-from feature_store.models import JobKind, RegistryManifest, StreamEventState, StreamFeatureEvent
+from feature_store.models import (
+    FeatureQuality,
+    JobKind,
+    QualityPolicy,
+    RegistryManifest,
+    StreamEventState,
+    StreamFeatureEvent,
+)
 from feature_store.registry import Registry
 from feature_store.streaming import StreamConsumer
 
@@ -193,3 +201,40 @@ def test_conflicting_duplicate_is_dead_lettered_after_earlier_message_is_flushed
     assert [message.offset() for message in consumer.committed] == [1, 2]
     assert producer.produced[0][0] == "account-features.dlq"
     assert b"different" in producer.produced[0][1]
+
+
+@pytest.mark.parametrize(
+    ("policy", "online_count", "dead_letter_count"),
+    [
+        (QualityPolicy.REJECT, 0, 0),
+        (QualityPolicy.QUARANTINE, 0, 1),
+        (QualityPolicy.REPORT, 1, 0),
+    ],
+)
+def test_stream_quality_policy_precedes_all_mutations(
+    session: Session,
+    manifest: RegistryManifest,
+    policy: QualityPolicy,
+    online_count: int,
+    dead_letter_count: int,
+) -> None:
+    changed = manifest.model_copy(deep=True)
+    changed.feature_views[0].quality_policy = policy
+    changed.feature_views[0].features[0].quality = FeatureQuality(minimum=0)
+    stream, consumer, producer, offline, online = make_stream(session, changed)
+    stream.now = lambda: datetime(2025, 1, 1, tzinfo=UTC)
+    stream._handle(
+        FakeMessage("account-features", 0, 1, payload(amount=-1.0))  # type: ignore[arg-type]
+    )
+    stream.flush()
+
+    assert len(online.events) == online_count
+    assert len(producer.produced) == dead_letter_count
+    if policy == QualityPolicy.QUARANTINE:
+        assert "feature-store-quality-error" in producer.produced[0][2]
+        assert len(producer.produced[0][2]["feature-store-quality-error"]) <= 500
+    assert [message.offset() for message in consumer.committed] == [1]
+    assert sum(table.num_rows for table in offline.tables.values()) == online_count
+    with stream.session_factory() as check:
+        record = check.scalar(select(StreamEventRecord))
+        assert (record is not None) == bool(online_count)

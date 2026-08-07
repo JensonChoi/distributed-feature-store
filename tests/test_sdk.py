@@ -6,7 +6,12 @@ from pathlib import Path
 
 import httpx
 
-from feature_store.models import RegistryManifest, RegistryMetadataPatch, RegistryTarget
+from feature_store.models import (
+    DataQualitySummary,
+    RegistryManifest,
+    RegistryMetadataPatch,
+    RegistryTarget,
+)
 from feature_store.sdk import FeatureStoreClient
 
 
@@ -89,6 +94,46 @@ def test_sdk_parses_async_historical_job() -> None:
         )
     assert result.kind == "historical_query"
     assert result.id == "job-1"
+
+
+def test_sdk_parses_backfill_data_quality_summary() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "job-1",
+                "kind": "backfill",
+                "status": "succeeded",
+                "payload": {},
+                "checkpoints": [],
+                "error": None,
+                "failure_kind": None,
+                "attempt_count": 1,
+                "max_attempts": 3,
+                "next_attempt_at": None,
+                "worker_id": None,
+                "lease_expires_at": None,
+                "last_heartbeat_at": None,
+                "created_at": datetime(2025, 1, 1, tzinfo=UTC).isoformat(),
+                "started_at": None,
+                "finished_at": datetime(2025, 1, 1, tzinfo=UTC).isoformat(),
+                "result": {
+                    "policy": "quarantine",
+                    "evaluated_rows": 2,
+                    "valid_rows": 1,
+                    "invalid_rows": 1,
+                    "quarantined_rows": 1,
+                    "counts_by_constraint": {"minimum": 1},
+                },
+            },
+        )
+
+    with FeatureStoreClient(
+        "http://feature-store", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = client.job("job-1")
+    assert isinstance(result.result, DataQualitySummary)
+    assert result.result.counts_by_constraint == {"minimum": 1}
 
 
 def test_sdk_streams_job_result_to_file(tmp_path: Path) -> None:
