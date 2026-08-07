@@ -20,7 +20,12 @@ from feature_store.config import get_settings
 from feature_store.db import SessionLocal, StreamEventRecord, init_db
 from feature_store.jobs import JobService
 from feature_store.ledger import RegistrationResult, StreamEventLedger
-from feature_store.models import StreamEventState, StreamFeatureEvent, validate_feature_value
+from feature_store.models import (
+    QualityPolicy,
+    StreamEventState,
+    StreamFeatureEvent,
+    validate_feature_value,
+)
 from feature_store.observability import (
     METRICS,
     Metrics,
@@ -29,6 +34,7 @@ from feature_store.observability import (
 )
 from feature_store.offline import OfflineStore
 from feature_store.online import OnlineStore
+from feature_store.quality import validate_quality_event
 from feature_store.registry import Registry
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,7 @@ class StreamConsumer:
         online: OnlineStore | None = None,
         session_factory: Callable[[], Session] = SessionLocal,
         metrics: Metrics = METRICS,
+        now: Callable[[], datetime] | None = None,
     ):
         self.consumer = consumer
         self.producer = producer
@@ -58,6 +65,7 @@ class StreamConsumer:
         self.session_factory = session_factory
         self.settings = get_settings()
         self.metrics = metrics
+        self.now = now or (lambda: datetime.now(UTC))
         self.buffers: dict[str, dict[str, BufferedEvent]] = defaultdict(dict)
         self.last_flush = time.monotonic()
 
@@ -103,9 +111,8 @@ class StreamConsumer:
             event = StreamFeatureEvent.model_validate(payload)
             if event.event_timestamp.tzinfo is None:
                 raise ValueError("event_timestamp must include a timezone")
-            ingestion_lag = (
-                datetime.now(UTC) - event.event_timestamp.astimezone(UTC)
-            ).total_seconds()
+            ingestion_time = self.now()
+            ingestion_lag = (ingestion_time - event.event_timestamp.astimezone(UTC)).total_seconds()
             self.metrics.stream_ingestion_lag.labels(event.feature_view).observe(
                 max(0.0, ingestion_lag)
             )
@@ -128,6 +135,40 @@ class StreamConsumer:
                     )
                 for feature in view.features:
                     validate_feature_value(feature.dtype, event.values[feature.name])
+                policy = view.effective_quality_policy
+                validation = validate_quality_event(
+                    event.values,
+                    view.features,
+                    event_timestamp=event.event_timestamp,
+                    ingestion_time=ingestion_time,
+                )
+                for constraint, count in validation.counts_by_constraint.items():
+                    self.metrics.quality_violations.labels(
+                        view.ref, "stream", policy, constraint
+                    ).inc(count)
+                if validation.violations:
+                    logger.warning(
+                        "stream data quality violations for %s: policy=%s invalid_rows=%d "
+                        "constraints=%s",
+                        view.ref,
+                        policy,
+                        len(validation.invalid_row_indexes),
+                        ",".join(item.value for item in validation.counts_by_constraint),
+                    )
+                    if policy == QualityPolicy.REJECT:
+                        self.flush()
+                        self.consumer.commit(message=message, asynchronous=False)
+                        self.metrics.stream_events.labels("quality_rejected").inc()
+                        outcome = "quality_rejected"
+                        return
+                    if policy == QualityPolicy.QUARANTINE:
+                        self._dead_letter(message, validation.bounded_message(), quality=True)
+                        self.flush()
+                        self.consumer.commit(message=message, asynchronous=False)
+                        self.metrics.stream_events.labels("quality_quarantined").inc()
+                        self.metrics.stream_dead_letters.labels("quality").inc()
+                        outcome = "quality_quarantined"
+                        return
                 registration = StreamEventLedger(session).register(
                     event,
                     source_topic=message.topic(),
@@ -216,7 +257,7 @@ class StreamConsumer:
             buffered.messages.append(message)
         return created
 
-    def _dead_letter(self, message: Message, error: str) -> None:
+    def _dead_letter(self, message: Message, error: str, *, quality: bool = False) -> None:
         topic = f"{message.topic()}.dlq"
         with self.session_factory() as session:
             for record in Registry(session).list_records("stream_source"):
@@ -228,7 +269,9 @@ class StreamConsumer:
             topic,
             key=message.key(),
             value=message.value(),
-            headers={"feature-store-error": error[:500]},
+            headers={
+                "feature-store-quality-error" if quality else "feature-store-error": error[:500]
+            },
         )
         self.producer.flush(10)
 

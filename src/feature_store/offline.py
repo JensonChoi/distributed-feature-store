@@ -21,6 +21,10 @@ class OfflineStore:
         safe = view_ref.replace("@", "/")
         return f"s3://{self.settings.offline_bucket}/views/{safe}"
 
+    def quarantine_uri(self, view_ref: str, job_id: str) -> str:
+        safe = view_ref.replace("@", "/")
+        return f"s3://{self.settings.offline_bucket}/quarantine/{safe}/{job_id}"
+
     def load(self, uri: str, *, version: int | None = None) -> pa.Table:
         table = DeltaTable(uri, version=version, storage_options=self._options(uri))
         return table.to_pyarrow_table()

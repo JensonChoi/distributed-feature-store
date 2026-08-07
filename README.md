@@ -12,6 +12,7 @@ the registry and durable jobs.
 - Inline and durable historical retrieval with streamed Parquet results.
 - Leased, resumable jobs with heartbeats, fenced completion, and bounded retries.
 - Watermark-driven incremental materialization with late-arrival lookback and coalescing.
+- Immutable data quality contracts with reject, quarantine, and report handling.
 - Idempotent, out-of-order-safe online updates and durable offline stream ingestion.
 - One typed contract across the Python SDK, CLI, and REST API.
 
@@ -53,6 +54,22 @@ Feature views have exact `name@major.minor.patch` identities. Historical queries
 services must pin exact feature references such as
 `account_transaction_features@1.0.0:txn_count_1h`. Applying a changed definition under an
 existing identity returns a conflict.
+
+## Data quality contracts
+
+Features may declare semantic constraints in a nested `quality` block: `nullable` (default
+`true`), inclusive numeric `minimum`/`maximum`, type-compatible `accepted_values`, batch-chunk
+`unique`, and `max_age_seconds`. A feature view selects `reject`, `quarantine`, or `report` with
+`quality_policy`; an omitted policy behaves as `reject`. Contracts are immutable specification
+fields, so changing one requires a new feature-view version.
+
+Batch quality runs after SQL transformation and physical schema checks. Reject mode fails the
+chunk before its view write, quarantine mode writes annotated invalid rows to a versioned Delta
+location and continues with valid rows, and report mode writes every row. Backfill job results
+contain cumulative evaluated, valid, invalid, and quarantined counts plus bounded counts by
+constraint. Streaming evaluates the same contracts before its durable ledger and online/offline
+writes. Rejected messages are committed without payload retention, quarantined messages use the
+configured dead-letter topic, and report mode continues through the replay-safe pipeline.
 
 ## Registry validation and planning
 
@@ -155,7 +172,8 @@ remains available through `feature-store materialize FEATURE_VIEW START END`.
 ## Freshness and serving metrics
 
 Prometheus measures online reads/upserts, historical inline/async queries, jobs, materialization
-freshness, and stream processing. Served-age histograms use the persisted feature event time:
+freshness, data quality violations, and stream processing. Served-age histograms use the
+persisted feature event time:
 online age is measured against wall-clock read time, while historical age is measured between
 the observation and selected point-in-time row. Materialization exports both watermark age and
 freshest-source-event age. Queue and ledger gauges include depth and oldest-record age.

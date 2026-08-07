@@ -208,13 +208,13 @@ def historical_query(
     return retriever.query(query.observations, query.features, query.feature_service)
 
 
-@app.post("/v1/jobs/backfills", status_code=202)
+@app.post("/v1/jobs/backfills", status_code=202, response_model=JobResponse)
 def create_backfill(request: JobRequest, session: Session = Depends(get_session)) -> dict[str, Any]:
     Registry(session).feature_view(request.feature_view)
     return serialize_job(JobService(session).create(JobKind.BACKFILL, request))
 
 
-@app.post("/v1/jobs/materializations", status_code=202)
+@app.post("/v1/jobs/materializations", status_code=202, response_model=JobResponse)
 def create_materialization(
     request: JobRequest, session: Session = Depends(get_session)
 ) -> dict[str, Any]:
@@ -222,7 +222,7 @@ def create_materialization(
     return serialize_job(JobService(session).create(JobKind.MATERIALIZE, request))
 
 
-@app.post("/v1/jobs/materializations:incremental", status_code=202)
+@app.post("/v1/jobs/materializations:incremental", status_code=202, response_model=JobResponse)
 def create_incremental_materialization(
     request: IncrementalMaterializationRequest,
     session: Session = Depends(get_session),
@@ -233,12 +233,12 @@ def create_incremental_materialization(
     return serialize_job(JobService(session).create_incremental_materialization(request))
 
 
-@app.get("/v1/jobs")
+@app.get("/v1/jobs", response_model=list[JobResponse])
 def list_jobs(limit: int = 100, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
     return [serialize_job(job) for job in JobService(session).list(min(limit, 500))]
 
 
-@app.get("/v1/jobs/{job_id}")
+@app.get("/v1/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
         return serialize_job(JobService(session).get(job_id))
@@ -278,7 +278,7 @@ def get_job_result(
     )
 
 
-@app.post("/v1/jobs/{job_id}:cancel")
+@app.post("/v1/jobs/{job_id}:cancel", response_model=JobResponse)
 def cancel_job(job_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
         return serialize_job(JobService(session).cancel(job_id))
@@ -288,7 +288,7 @@ def cancel_job(job_id: str, session: Session = Depends(get_session)) -> dict[str
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/v1/jobs/{job_id}:retry")
+@app.post("/v1/jobs/{job_id}:retry", response_model=JobResponse)
 def retry_job(job_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
     try:
         return serialize_job(JobService(session).retry(job_id))

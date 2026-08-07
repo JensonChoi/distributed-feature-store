@@ -18,6 +18,10 @@ app.add_typer(registry_app, name="registry")
 
 
 def _print(value: object) -> None:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    elif isinstance(value, list) and value and hasattr(value[0], "model_dump"):
+        value = [item.model_dump(mode="json") for item in value]
     typer.echo(json.dumps(value, indent=2, default=str))
 
 

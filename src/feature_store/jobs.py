@@ -23,6 +23,7 @@ from feature_store.artifacts import ArtifactStorage
 from feature_store.config import Settings, get_settings
 from feature_store.db import JobRecord, MaterializationState, StreamEventRecord
 from feature_store.models import (
+    DataQualitySummary,
     Feature,
     HistoricalQuery,
     IncrementalMaterializationRequest,
@@ -30,6 +31,7 @@ from feature_store.models import (
     JobKind,
     JobRequest,
     JobStatus,
+    QualityPolicy,
     RegistryWarning,
     StreamEventState,
     StreamFeatureEvent,
@@ -39,11 +41,18 @@ from feature_store.observability import METRICS, Metrics
 from feature_store.offline import OfflineStore, normalize_uri
 from feature_store.online import OnlineStore
 from feature_store.pit import HistoricalRetriever
+from feature_store.quality import QualityValidation, validate_quality_table
 from feature_store.registry import Registry, RegistryConflictError, RegistryNotFoundError
 
 
 class LeaseLostError(RuntimeError):
     """The worker no longer owns the job and must not persist execution state."""
+
+
+class DataQualityError(ValueError):
+    def __init__(self, message: str, summary: DataQualitySummary):
+        super().__init__(message)
+        self.summary = summary
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -550,7 +559,7 @@ class JobExecutor:
         result_metadata: dict[str, Any] | None = None
         try:
             if job.kind == JobKind.BACKFILL:
-                self._backfill(job, lease_token)
+                result_metadata = self._backfill(job, lease_token)
             elif job.kind == JobKind.MATERIALIZE:
                 result_metadata = self._materialize(job, lease_token)
             elif job.kind == JobKind.OFFLINE_APPEND:
@@ -574,7 +583,12 @@ class JobExecutor:
         except Exception as exc:
             error = traceback.format_exc(limit=10)
             self.session.rollback()
-            self._finalize_failure(job, lease_token, exc, error)
+            failure_result = (
+                exc.summary.model_dump(mode="json") if isinstance(exc, DataQualityError) else None
+            )
+            self._finalize_failure(
+                job, lease_token, exc, error, result_metadata=failure_result
+            )
             return
         finally:
             if attempt_result_uri:
@@ -703,7 +717,13 @@ class JobExecutor:
         self.session.refresh(job)
 
     def _finalize_failure(
-        self, job: JobRecord, lease_token: str, exc: Exception, error: str
+        self,
+        job: JobRecord,
+        lease_token: str,
+        exc: Exception,
+        error: str,
+        *,
+        result_metadata: dict[str, Any] | None = None,
     ) -> None:
         now = self.now()
         terminal = self._is_terminal_failure(exc)
@@ -753,6 +773,7 @@ class JobExecutor:
                     lease_expires_at=None,
                     last_heartbeat_at=None,
                     artifact_expires_at=artifact_expires_at,
+                    result_metadata=result_metadata,
                 )
             ),
         )
@@ -843,12 +864,94 @@ class JobExecutor:
             ),
         )
 
-    def _backfill(self, job: JobRecord, lease_token: str) -> None:
+    @staticmethod
+    def _backfill_checkpoint(cursor: str, summary: DataQualitySummary) -> str:
+        return "backfill:" + json.dumps(
+            {"cursor": cursor, "quality": summary.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _has_backfill_checkpoint(checkpoints: list[str], cursor: str) -> bool:
+        if cursor in checkpoints:
+            return True
+        for checkpoint in checkpoints:
+            if checkpoint.startswith("backfill:"):
+                payload = json.loads(checkpoint.removeprefix("backfill:"))
+                if payload.get("cursor") == cursor:
+                    return True
+        return False
+
+    @staticmethod
+    def _quality_summary(
+        checkpoints: list[str], policy: QualityPolicy
+    ) -> DataQualitySummary:
+        for checkpoint in reversed(checkpoints):
+            if checkpoint.startswith("quality:"):
+                return DataQualitySummary.model_validate_json(checkpoint.removeprefix("quality:"))
+            if checkpoint.startswith("backfill:"):
+                payload = json.loads(checkpoint.removeprefix("backfill:"))
+                return DataQualitySummary.model_validate(payload["quality"])
+        return DataQualitySummary(
+            policy=policy,
+            evaluated_rows=0,
+            valid_rows=0,
+            invalid_rows=0,
+            quarantined_rows=0,
+            counts_by_constraint={},
+        )
+
+    def _observe_quality(
+        self,
+        view_ref: str,
+        policy: QualityPolicy,
+        validation: QualityValidation,
+        *,
+        path: str,
+    ) -> None:
+        for constraint, count in validation.counts_by_constraint.items():
+            self.metrics.quality_violations.labels(
+                view_ref, path, policy, constraint
+            ).inc(count)
+
+    def _quarantine_batch(
+        self,
+        job: JobRecord,
+        view_ref: str,
+        table: pa.Table,
+        validation: QualityValidation,
+        date: str,
+    ) -> None:
+        indexes = validation.invalid_row_indexes
+        if not indexes:
+            return
+        errors_by_row: dict[int, list[str]] = {}
+        for violation in validation.violations:
+            errors_by_row.setdefault(violation.row_index, []).append(
+                f"{violation.feature}:{violation.constraint}"
+            )
+        quarantined = table.take(pa.array(indexes, type=pa.int64()))
+        quarantined = quarantined.append_column(
+            "quality_errors", pa.array([errors_by_row[index] for index in indexes])
+        )
+        quarantined = quarantined.append_column(
+            "quality_policy", pa.array([QualityPolicy.QUARANTINE] * len(indexes))
+        )
+        target = self.offline.quarantine_uri(view_ref, job.id)
+        if self.offline.exists(target):
+            self.offline.overwrite_partition(target, quarantined, f"event_date = '{date}'")
+        else:
+            self.offline.append(target, quarantined, partition_by="event_date")
+
+    def _backfill(self, job: JobRecord, lease_token: str) -> dict[str, Any]:
         view = self.registry.feature_view(job.payload["feature_view"])
         source = self.registry.batch_source(view.batch_source)
         entity = self.registry.entity(view.entity)
         start = datetime.fromisoformat(job.payload["start"]).astimezone(UTC)
         end = datetime.fromisoformat(job.payload["end"]).astimezone(UTC)
+        policy = view.effective_quality_policy
+        summary = self._quality_summary(job.checkpoints, policy)
         cursor = start
         while cursor < end:
             self._require_ownership(job, lease_token)
@@ -858,7 +961,7 @@ class JobExecutor:
             if chunk_end <= cursor:
                 chunk_end = min(end, cursor + timedelta(days=1))
             checkpoint = cursor.isoformat()
-            if checkpoint not in job.checkpoints:
+            if not self._has_backfill_checkpoint(job.checkpoints, checkpoint):
                 self._require_ownership(job, lease_token)
                 lookback = timedelta(seconds=view.ttl_seconds or 0)
                 source_table = self.offline.load_range(
@@ -876,9 +979,34 @@ class JobExecutor:
                 output = output.filter(mask)
                 event_dates = pc.strftime(output["event_timestamp"], format="%Y-%m-%d")
                 output = output.append_column("event_date", event_dates)
+                validation = validate_quality_table(
+                    output, view.features, reference_time=chunk_end
+                )
+                self._observe_quality(view.ref, policy, validation, path="batch")
+                invalid_indexes = validation.invalid_row_indexes
+                valid_indexes = validation.valid_row_indexes
+                counts = dict(summary.counts_by_constraint)
+                for constraint, count in validation.counts_by_constraint.items():
+                    counts[constraint] = counts.get(constraint, 0) + count
+                next_summary = DataQualitySummary(
+                    policy=policy,
+                    evaluated_rows=summary.evaluated_rows + validation.evaluated_rows,
+                    valid_rows=summary.valid_rows + len(valid_indexes),
+                    invalid_rows=summary.invalid_rows + len(invalid_indexes),
+                    quarantined_rows=(
+                        summary.quarantined_rows
+                        + (len(invalid_indexes) if policy == QualityPolicy.QUARANTINE else 0)
+                    ),
+                    counts_by_constraint=counts,
+                )
+                if invalid_indexes and policy == QualityPolicy.REJECT:
+                    raise DataQualityError(validation.bounded_message(), next_summary)
                 target = self.offline.view_uri(view.ref)
                 date = cursor.date().isoformat()
                 self._require_ownership(job, lease_token)
+                if policy == QualityPolicy.QUARANTINE:
+                    self._quarantine_batch(job, view.ref, output, validation, date)
+                    output = output.take(pa.array(valid_indexes, type=pa.int64()))
                 if self.offline.exists(target):
                     existing = self.offline.load(target)
                     same_partition = pc.equal(existing["event_date"], pa.scalar(date))
@@ -891,8 +1019,14 @@ class JobExecutor:
                     self.offline.overwrite_partition(target, replacement, f"event_date = '{date}'")
                 elif output.num_rows:
                     self.offline.append(target, output, partition_by="event_date")
-                self._commit_checkpoints(job, lease_token, [*job.checkpoints, checkpoint])
+                summary = next_summary
+                self._commit_checkpoints(
+                    job,
+                    lease_token,
+                    [*job.checkpoints, self._backfill_checkpoint(checkpoint, summary)],
+                )
             cursor = chunk_end
+        return summary.model_dump(mode="json")
 
     def _materialize(self, job: JobRecord, lease_token: str) -> dict[str, Any]:
         view = self.registry.feature_view(job.payload["feature_view"])
